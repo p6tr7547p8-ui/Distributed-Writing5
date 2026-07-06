@@ -1,0 +1,2358 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>レポート生成過程プラットフォーム(学生用)</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script>
+// ============================================================
+// 【管理者向け 配布前設定】
+// 複数人(学生・教員が別々のPC/スマホ)で運用する場合は、下の __SYNC_URL__ に
+// Firebase Realtime Database のURLを記入してからホスティングしてください。
+// 例: window.__SYNC_URL__ = "https://myclass-default-rtdb.firebaseio.com";
+// 空のままの場合、データは各自のブラウザ内にのみ保存されます。
+// ============================================================
+window.__SYNC_URL__ = "https://writing5-default-rtdb.firebaseio.com/";
+window.__ROLE__ = "student";
+window.__STANDALONE__ = true;
+window.storage = {
+  async set(key, value) { localStorage.setItem("rpp:" + key, value); return { key: key, value: value }; },
+  async get(key) { const v = localStorage.getItem("rpp:" + key); if (v == null) throw new Error("key not found: " + key); return { key: key, value: v }; },
+  async delete(key) { localStorage.removeItem("rpp:" + key); return { key: key, deleted: true }; },
+};
+// 万一のエラー時に白画面ではなく内容を表示(原因調査用)
+window.onerror = function (msg, src, line) {
+  var el = document.getElementById("root");
+  if (el) el.innerHTML = '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c;">エラーが発生しました:<br>' + msg + ' (line ' + line + ')<br><small>この画面のスクリーンショットを開発者に共有してください。</small></div>';
+};
+</script>
+</head>
+<body class="bg-stone-50">
+<noscript><div style="padding:2rem;font-family:sans-serif;">このアプリの動作にはJavaScriptが必要です。Safari / Chrome で開いてください。</div></noscript>
+<div id="root"><div style="padding:3rem 1.5rem;font-family:sans-serif;color:#78716c;text-align:center;">読み込み中です…<br><small>この表示のまま変わらない場合は、インターネット接続を確認し、Safari や Chrome などのブラウザで直接開いてください。</small></div></div>
+<script>
+const {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo
+} = React;
+
+// ============================================================
+// レポート生成過程 記録・追体験プラットフォーム (v3)
+//
+// v3での変更点(無料構成への対応):
+// - 検索: 「内蔵検索(無料・キー不要)」と「Google Custom Search API」の切替式。
+//   ※Google Custom Search JSON APIは新規受付終了と案内される場合があるため、
+//     その場合は内蔵検索を使用してください。
+// - 生成AI: 「内蔵AI(無料・キー不要)」と「Gemini API(無料枠)」の切替式。
+//   OpenAI(有料)連携は廃止。
+// ============================================================
+
+// 実行環境の判定:
+// - チャット内プレビュー(アーティファクト)では、セキュリティ制限により
+//   api.anthropic.com 以外の外部ドメインへの通信がブロックされる。
+//   → Gemini / Google検索APIはプレビュー内では接続不可(キーが正しくても失敗する)。
+// - スタンドアロン版(HTMLをブラウザで直接開く)では逆に、Gemini / Google APIが
+//   使用でき、内蔵AI(Anthropic経由)は使用できない。
+const STANDALONE = typeof window !== "undefined" && window.__STANDALONE__ === true;
+
+// 配布形態: window.__ROLE__ に "student" / "teacher" を設定すると
+// その役割専用アプリとして動作する(役割切替UIは表示されない)。
+// 未設定(開発プレビュー)の場合のみ、切替UIを表示する。
+const FIXED_ROLE = typeof window !== "undefined" && window.__ROLE__ || null;
+
+// ---------- 共有データベース(クラウド同期)層 ----------
+// Firebase Realtime Database の REST API を利用(SDK不要・fetchのみ)。
+// 管理者がHTML冒頭の window.__SYNC_URL__ にDB URLを設定して配布すると、
+// 学生版・教員版が同じデータベースを共有し、複数人での実運用が可能になる。
+let SYNC_URL = "";
+function setSyncUrl(u) {
+  SYNC_URL = (u || "").trim().replace(/\/+$/, "");
+}
+function syncEnabled() {
+  return !!SYNC_URL;
+}
+function cloudPath(key) {
+  // Firebaseのキーに使えない文字を避ける
+  return SYNC_URL + "/rpp/" + key.replace(/[.#$\[\]\/]/g, "_") + ".json";
+}
+async function cloudSet(key, jsonString) {
+  const r = await fetch(cloudPath(key), {
+    method: "PUT",
+    body: JSON.stringify(jsonString)
+  });
+  if (!r.ok) throw new Error("共有DBへの書き込みに失敗 (" + r.status + ")");
+}
+async function cloudGet(key) {
+  const r = await fetch(cloudPath(key));
+  if (!r.ok) throw new Error("共有DBの読み取りに失敗 (" + r.status + ")");
+  return await r.json(); // 存在しない場合は null
+}
+
+// ---------- ストレージ層 (DB相当) ----------
+const memStore = {};
+async function dbSet(key, value) {
+  const json = JSON.stringify(value);
+  memStore[key] = json;
+  // 共有DBが設定されていればそちらを主とする(学生・教員間でデータ共有)
+  if (syncEnabled()) {
+    try {
+      await cloudSet(key, json);
+      return {
+        ok: true,
+        persisted: true,
+        cloud: true
+      };
+    } catch (e) {
+      console.warn("共有DBへの保存に失敗(ローカルへ退避):", e);
+    }
+  }
+  try {
+    if (window.storage) {
+      await window.storage.set(key, json, false);
+      const back = await window.storage.get(key, false);
+      if (!back || back.value == null) throw new Error("保存後の検証に失敗");
+    }
+  } catch (e) {
+    console.warn("永続ストレージへの保存に失敗(メモリ上には保持):", e);
+    return {
+      ok: true,
+      persisted: false,
+      error: String(e && e.message || e)
+    };
+  }
+  return {
+    ok: true,
+    persisted: true,
+    cloud: false
+  };
+}
+async function dbGet(key) {
+  if (syncEnabled()) {
+    try {
+      const v = await cloudGet(key);
+      if (v != null) return JSON.parse(v);
+      return null; // 共有DB上に存在しない
+    } catch (e) {
+      console.warn("共有DBの読み取りに失敗(ローカルへフォールバック):", e);
+    }
+  }
+  try {
+    if (window.storage) {
+      const r = await window.storage.get(key, false);
+      if (r && r.value != null) return JSON.parse(r.value);
+    }
+  } catch (e) {/* key不存在など */}
+  if (memStore[key] != null) return JSON.parse(memStore[key]);
+  return null;
+}
+const INDEX_KEY = "rpp-index";
+const SETTINGS_KEY = "rpp-settings";
+async function loadIndex() {
+  const a = (await dbGet(INDEX_KEY)) || [];
+  let b = [];
+  if (memStore[INDEX_KEY]) {
+    try {
+      b = JSON.parse(memStore[INDEX_KEY]);
+    } catch (e) {}
+  }
+  return Array.from(new Set([...b, ...a]));
+}
+async function saveSubmission(sub) {
+  const idx = await loadIndex();
+  if (!idx.includes(sub.id)) idx.unshift(sub.id);
+  const r1 = await dbSet("rpp-sub-" + sub.id, sub);
+  const r2 = await dbSet(INDEX_KEY, idx);
+  const back = await dbGet("rpp-sub-" + sub.id);
+  if (!back) throw new Error("提出データの保存を確認できませんでした");
+  return {
+    persisted: r1.persisted && r2.persisted
+  };
+}
+async function loadSubmission(id) {
+  return await dbGet("rpp-sub-" + id);
+}
+
+// ---------- 差分(diff)ユーティリティ ----------
+function makeDiff(oldT, newT) {
+  let p = 0;
+  const maxP = Math.min(oldT.length, newT.length);
+  while (p < maxP && oldT.charCodeAt(p) === newT.charCodeAt(p)) p++;
+  let s = 0;
+  const maxS = Math.min(oldT.length, newT.length) - p;
+  while (s < maxS && oldT.charCodeAt(oldT.length - 1 - s) === newT.charCodeAt(newT.length - 1 - s)) s++;
+  return {
+    p,
+    s,
+    i: newT.slice(p, newT.length - s)
+  };
+}
+function applyDiff(oldT, d) {
+  return oldT.slice(0, d.p) + d.i + oldT.slice(oldT.length - d.s);
+}
+
+// ============================================================
+// ブロックチェーン / NFT 層
+//
+// 論文(Distributed Reading5)のNFTモデルに対応:
+//   原読者が体験データをNFT化 → 追体験者がNFTを取得して追体験
+// 本システムでは:
+//   学生が提出時に「生成過程NFT」をミント → 教員が共有(チェーン上に記録)
+//   → 他の学生がNFTを取得(ACQUIRE)して生成過程を追体験
+//
+// 実装は2層:
+//  (A) ローカルブロックチェーン: SHA-256でハッシュ連結されたブロック列。
+//      軽量Proof of Work(先頭2桁が"00")付き。改ざんは検証機能で検出可能。
+//  (B) 実チェーンアンカリング(スタンドアロン版・任意): MetaMask経由で
+//      ブロックハッシュをEthereumテストネット(Sepolia)のトランザクション
+//      dataフィールドに記録し、公開チェーンで存在証明を行う。
+//
+// 参考: 本番でERC-721準拠のNFTにする場合のSolidityコントラクト例
+//   // SPDX-License-Identifier: MIT
+//   pragma solidity ^0.8.20;
+//   import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+//   contract ProcessNFT is ERC721URIStorage {
+//     uint256 private _next;
+//     constructor() ERC721("ReportProcess", "RPP") {}
+//     function mint(string memory tokenURI_) external returns (uint256) {
+//       uint256 id = ++_next;
+//       _safeMint(msg.sender, id);
+//       _setTokenURI(id, tokenURI_); // 生成過程ログのハッシュ/メタデータを格納
+//       return id;
+//     }
+//   }
+// ============================================================
+
+// --- SHA-256 (Web Crypto API / 非対応環境向けフォールバック付き) ---
+async function sha256Hex(str) {
+  try {
+    if (typeof crypto !== "undefined" && crypto.subtle) {
+      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+  } catch (e) {}
+  // フォールバック(簡易ハッシュ。crypto.subtleが使えない環境用)
+  let h1 = 0x811c9dc5,
+    h2 = 0xcbf29ce4;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 = (h1 ^ c) * 16777619 >>> 0;
+    h2 = (h2 ^ (c << 7 | c >> 3)) * 16777619 >>> 0;
+  }
+  return (h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0")).repeat(4).slice(0, 64);
+}
+
+// --- DID (分散型識別子) ---
+// Web5のDIDs(Decentralized Identifiers)に倣い、ユーザー名から決定的にIDを生成
+function didOf(name) {
+  const s = name || "anonymous";
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (h * 33 >>> 0 ^ s.charCodeAt(i)) >>> 0;
+  return "did:rpp:" + h.toString(16).padStart(8, "0");
+}
+const CHAIN_KEY = "rpp-chain";
+const ANCHOR_KEY = "rpp-anchors";
+async function loadChain() {
+  return (await dbGet(CHAIN_KEY)) || [];
+}
+async function computeBlockHash(b) {
+  return sha256Hex(b.index + "|" + b.prevHash + "|" + b.timestamp + "|" + JSON.stringify(b.data) + "|" + b.nonce);
+}
+
+// ブロックを追加(軽量PoW: ハッシュ先頭2桁が"00"になるnonceを探索)
+async function addBlock(data) {
+  const chain = await loadChain();
+  if (chain.length === 0) {
+    const genesis = {
+      index: 0,
+      timestamp: Date.now(),
+      prevHash: "0".repeat(64),
+      data: {
+        type: "GENESIS",
+        note: "レポート生成過程チェーン 創世ブロック"
+      },
+      nonce: 0,
+      hash: ""
+    };
+    while (true) {
+      genesis.hash = await computeBlockHash(genesis);
+      if (genesis.hash.startsWith("00")) break;
+      genesis.nonce++;
+    }
+    chain.push(genesis);
+  }
+  const prev = chain[chain.length - 1];
+  const block = {
+    index: chain.length,
+    timestamp: Date.now(),
+    prevHash: prev.hash,
+    data,
+    nonce: 0,
+    hash: ""
+  };
+  while (true) {
+    block.hash = await computeBlockHash(block);
+    if (block.hash.startsWith("00")) break;
+    block.nonce++;
+  }
+  chain.push(block);
+  await dbSet(CHAIN_KEY, chain);
+  return block;
+}
+
+// チェーン全体の整合性検証(ハッシュ再計算・連結・PoWの3点)
+async function verifyChain() {
+  const chain = await loadChain();
+  const problems = [];
+  for (let i = 0; i < chain.length; i++) {
+    const b = chain[i];
+    const h = await computeBlockHash(b);
+    if (h !== b.hash) problems.push("ブロック#" + i + ": ハッシュ不一致(ブロックデータが改ざんされた可能性)");
+    if (i > 0 && b.prevHash !== chain[i - 1].hash) problems.push("ブロック#" + i + ": 前ブロックとの連結が不整合");
+    if (b.hash && !b.hash.startsWith("00")) problems.push("ブロック#" + i + ": Proof of Work条件未達");
+  }
+  return {
+    ok: problems.length === 0,
+    problems,
+    length: chain.length
+  };
+}
+
+// チェーンからNFTトークンの現在状態を導出(チェーン = 唯一の真実の記録)
+async function chainTokens() {
+  const chain = await loadChain();
+  const tokens = {};
+  chain.forEach(b => {
+    const d = b.data || {};
+    if (d.type === "MINT") {
+      tokens[d.tokenId] = {
+        tokenId: d.tokenId,
+        subId: d.subId,
+        title: d.title,
+        creator: d.owner,
+        creatorName: d.ownerName,
+        owners: [d.owner],
+        contentHash: d.contentHash,
+        shared: false,
+        blockIndex: b.index
+      };
+    }
+    if (d.type === "SHARE" && tokens[d.tokenId]) tokens[d.tokenId].shared = !!d.shared;
+    if (d.type === "ACQUIRE" && tokens[d.tokenId] && tokens[d.tokenId].owners.indexOf(d.owner) === -1) {
+      tokens[d.tokenId].owners.push(d.owner);
+    }
+  });
+  return tokens;
+}
+
+// 提出データの内容ハッシュ(NFTのcontentHashと照合して改ざん検出に使う)
+async function submissionContentHash(sub) {
+  return sha256Hex(JSON.stringify({
+    title: sub.title,
+    text: sub.text,
+    events: sub.events
+  }));
+}
+
+// --- 実チェーンアンカリング(MetaMask / Ethereum Sepoliaテストネット) ---
+async function anchorToEthereum(hashHex) {
+  if (typeof window === "undefined" || !window.ethereum) throw new Error("NO_WALLET");
+  const accounts = await window.ethereum.request({
+    method: "eth_requestAccounts"
+  });
+  const from = accounts[0];
+  // 自分宛て0値トランザクションのdataにハッシュを埋め込む(存在証明 / Proof of Existence)
+  const txHash = await window.ethereum.request({
+    method: "eth_sendTransaction",
+    params: [{
+      from,
+      to: from,
+      value: "0x0",
+      data: "0x" + hashHex
+    }]
+  });
+  return {
+    txHash,
+    from
+  };
+}
+async function loadAnchors() {
+  return (await dbGet(ANCHOR_KEY)) || [];
+}
+async function saveAnchor(anchor) {
+  const list = await loadAnchors();
+  list.unshift(anchor);
+  await dbSet(ANCHOR_KEY, list);
+}
+
+// ============================================================
+// 外部API
+// ============================================================
+
+// --- 検索(1): 内蔵検索 -- 無料・キー不要 ---
+// このアーティファクト環境に組み込まれたAI(Anthropic API)のWeb検索ツールを利用。
+async function callBuiltinSearch(query) {
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1500,
+        messages: [{
+          role: "user",
+          content: "次のクエリでWeb検索を実行し、上位5件の結果をJSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "URL", "snippet": "内容の短い要約(日本語)"} の形式。' + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。\nクエリ: " + query
+        }],
+        tools: [{
+          type: "web_search_20250305",
+          name: "web_search"
+        }]
+      })
+    });
+  } catch (e) {
+    throw new Error("BUILTIN_UNAVAILABLE");
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(STANDALONE ? "BUILTIN_UNAVAILABLE" : "内蔵検索: " + (data.error.message || "エラー"));
+  const text = (data.content || []).map(b => b.type === "text" ? b.text : "").join("\n");
+  const clean = text.replace(/```json|```/g, "").trim();
+  const m = clean.match(/\[[\s\S]*\]/);
+  if (!m) throw new Error("検索結果の解析に失敗しました。もう一度お試しください。");
+  const arr = JSON.parse(m[0]);
+  return arr.map(it => ({
+    title: it.title || "",
+    link: it.link || it.url || "",
+    snippet: it.snippet || ""
+  }));
+}
+
+// --- 検索(2): Google Custom Search JSON API (キー必要) ---
+async function callGoogleSearch(query, settings) {
+  if (!settings.googleKey || !settings.googleCx) throw new Error("NO_KEY");
+  const url = "https://www.googleapis.com/customsearch/v1?key=" + encodeURIComponent(settings.googleKey) + "&cx=" + encodeURIComponent(settings.googleCx) + "&q=" + encodeURIComponent(query) + "&num=6";
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    throw new Error("NETWORK_BLOCKED");
+  }
+  const data = await res.json();
+  if (data.error) throw new Error("Google API: " + data.error.message);
+  return (data.items || []).map(it => ({
+    title: it.title,
+    link: it.link,
+    snippet: it.snippet || ""
+  }));
+}
+
+// --- 検索(3): Gemini検索 -- GeminiのGoogle検索グラウンディング(無料枠・Geminiキーで利用可) ---
+// Gemini API の google_search ツールを使い、実際のGoogle検索に基づく結果を取得する。
+// これによりGeminiキー1つで「検索」と「AI」の両方が同一アプリ内で動作する。
+async function callGeminiSearch(query, settings) {
+  if (!settings.geminiKey) throw new Error("NO_KEY");
+  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
+  let lastErr = null;
+  for (const model of models) {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: "「" + query + "」についてGoogle検索を実行し、検索結果の上位5件をJSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "実際のページのURL", "snippet": "内容の要約(日本語で2〜3文)"} の形式。' + "linkは必ず http または https で始まる実在のURLにすること。" + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。"
+            }]
+          }],
+          tools: [{
+            google_search: {}
+          }]
+        })
+      });
+    } catch (e) {
+      throw new Error("NETWORK_BLOCKED");
+    }
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (e) {}
+    if (data.error) {
+      lastErr = new Error("Gemini検索: " + (data.error.message || res.status));
+      if (data.error.code === 404 || res.status === 404) continue; // モデル違いは次を試す
+      throw lastErr;
+    }
+    const cand = data.candidates && data.candidates[0];
+    const parts = cand && cand.content && cand.content.parts;
+    const text = (parts || []).map(p => p.text || "").join("");
+
+    // (1) モデルが返したJSONを解析
+    let items = [];
+    const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
+    if (m) {
+      try {
+        items = JSON.parse(m[0]).map(it => ({
+          title: it.title || "",
+          link: it.link || it.url || "",
+          snippet: it.snippet || ""
+        }));
+      } catch (e) {}
+    }
+    // (2) グラウンディング情報(実際の検索ソース)からURLを補完・追加
+    const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
+    const sources = chunks.filter(c => c.web).map(c => ({
+      title: c.web.title || c.web.uri,
+      link: c.web.uri,
+      snippet: ""
+    }));
+    if (items.length === 0 && sources.length > 0) {
+      items = sources.map(s => ({
+        ...s,
+        snippet: "(Google検索グラウンディングによるソース)"
+      }));
+    } else if (items.length > 0 && sources.length > 0) {
+      // JSON側にURLが無い項目へグラウンディングのURLを補完
+      items = items.map((it, i) => !it.link && sources[i] ? {
+        ...it,
+        link: sources[i].link
+      } : it);
+    }
+    if (items.length > 0) return items;
+    lastErr = new Error("Gemini検索: 結果の解析に失敗しました。もう一度お試しください。");
+  }
+  throw lastErr || new Error("Gemini検索: 呼び出しに失敗しました");
+}
+async function callBuiltinAI(prompt, context) {
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 2048,
+        messages: [{
+          role: "user",
+          content: "あなたは大学生のレポート執筆を支援するアシスタントです。" + "通常のチャットアシスタントと同じように、丁寧で分かりやすい日本語で、十分な詳しさで回答してください。\n\n" + (context ? "【現在のレポート本文(抜粋)】\n" + context.slice(0, 3000) + "\n\n" : "") + "【依頼】\n" + prompt
+        }]
+      })
+    });
+  } catch (e) {
+    throw new Error("BUILTIN_UNAVAILABLE");
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(STANDALONE ? "BUILTIN_UNAVAILABLE" : "内蔵AI: " + (data.error.message || "エラー"));
+  return (data.content || []).map(b => b.type === "text" ? b.text : "").filter(Boolean).join("\n");
+}
+
+// --- AI(2): Gemini API 無料枠 (Google AI Studioのキー必要) ---
+// モデル名やAPIバージョンの違いによる404は自動で別の組み合わせを試す。
+async function callGemini(prompt, context, settings) {
+  if (!settings.geminiKey) throw new Error("NO_KEY");
+  const contentText = "あなたは大学生のレポート執筆を支援するアシスタントです。" + "通常のチャットアシスタントと同じように、丁寧で分かりやすい日本語で、十分な詳しさと具体例を交えて回答してください。" + "必要に応じて構成を整理し、見出しや箇条書きも使って構いません。\n\n" + (context ? "【現在のレポート本文(抜粋)】\n" + context.slice(0, 3000) + "\n\n" : "") + "【依頼】\n" + prompt;
+  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
+  const versions = ["v1beta", "v1"];
+  let lastErr = null;
+  for (const model of models) {
+    for (const ver of versions) {
+      const url = "https://generativelanguage.googleapis.com/" + ver + "/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
+      let res;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{
+                text: contentText
+              }]
+            }],
+            generationConfig: {
+              maxOutputTokens: 4096,
+              temperature: 0.7
+            }
+          })
+        });
+      } catch (e) {
+        // fetch自体の失敗 = この実行環境から外部ドメインへの通信がブロックされている
+        throw new Error("NETWORK_BLOCKED");
+      }
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (e) {}
+      if (data.error) {
+        lastErr = new Error("Gemini API: " + (data.error.message || res.status));
+        // 404はモデル名/バージョン違いの可能性 → 次の組み合わせを試す
+        if (data.error.code === 404 || res.status === 404) continue;
+        // 401/403(キー無効)、429(無料枠上限)などは即時報告
+        throw lastErr;
+      }
+      const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+      const out = (parts || []).map(p => p.text || "").join("");
+      if (out) return out;
+      lastErr = new Error("Gemini API: 応答が空でした");
+    }
+  }
+  throw lastErr || new Error("Gemini API: 呼び出しに失敗しました");
+}
+
+// ---------- ユーティリティ ----------
+function fmtMs(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return h + "時間" + m % 60 + "分";
+  if (m > 0) return m + "分" + s % 60 + "秒";
+  return s + "秒";
+}
+function fmtClock(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  return String(m).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+}
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+const EVENT_META = {
+  edit: {
+    label: "執筆",
+    color: "bg-emerald-500",
+    text: "text-emerald-700",
+    ring: "ring-emerald-200"
+  },
+  paste: {
+    label: "コピペ",
+    color: "bg-amber-500",
+    text: "text-amber-700",
+    ring: "ring-amber-200"
+  },
+  search: {
+    label: "検索",
+    color: "bg-sky-500",
+    text: "text-sky-700",
+    ring: "ring-sky-200"
+  },
+  ai: {
+    label: "AI利用",
+    color: "bg-violet-500",
+    text: "text-violet-700",
+    ring: "ring-violet-200"
+  },
+  aiInsert: {
+    label: "AI挿入",
+    color: "bg-violet-500",
+    text: "text-violet-700",
+    ring: "ring-violet-200"
+  },
+  start: {
+    label: "開始",
+    color: "bg-stone-400",
+    text: "text-stone-600",
+    ring: "ring-stone-200"
+  },
+  submit: {
+    label: "提出",
+    color: "bg-stone-800",
+    text: "text-stone-800",
+    ring: "ring-stone-300"
+  }
+};
+
+// ---------- 文字単位の由来追跡(プロベナンス) ----------
+// 各編集イベントの差分(d)を先頭から再生し、最終本文の1文字ごとに
+// 由来タグ(t=手入力 / p=コピペ / a=AI由来)を割り当てる。
+// これにより:
+//  ・AI挿入後に削除した分は正しくカウントから除外される(依存率>100%バグの修正)
+//  ・AIの回答を部分的にコピペした場合(src:"ai"付きpaste)もAI由来に算入される
+function computeProvenance(events) {
+  let tags = [];
+  let valid = false;
+  for (const e of events) {
+    if (e.type === "start") {
+      tags = new Array((e.snapshot || "").length).fill("t");
+      valid = true;
+      continue;
+    }
+    if (e.d) {
+      const src = e.type === "aiInsert" ? "a" : e.type === "paste" ? e.src === "ai" ? "a" : "p" : "t";
+      const insLen = (e.d.i || "").length;
+      const p = Math.max(0, Math.min(e.d.p, tags.length));
+      const s = Math.max(0, Math.min(e.d.s, tags.length - p));
+      const ins = new Array(insLen).fill(src);
+      tags = tags.slice(0, p).concat(ins, tags.slice(tags.length - s));
+      valid = true;
+    }
+  }
+  return valid ? tags : null;
+}
+function computeStats(events, finalText) {
+  const total = finalText.length;
+  let searches = 0,
+    aiUses = 0,
+    pastes = 0;
+  let legacyPasted = 0,
+    legacyAi = 0;
+  let activeMs = 0;
+  let prevT = null;
+  events.forEach(e => {
+    if (e.type === "paste") {
+      pastes++;
+      if (e.src === "ai") legacyAi += (e.text || "").length;else legacyPasted += (e.text || "").length;
+    }
+    if (e.type === "aiInsert") legacyAi += (e.text || "").length;
+    if (e.type === "search") searches++;
+    if (e.type === "ai") aiUses++;
+    if (prevT != null) {
+      const gap = e.t - prevT;
+      if (gap < 30000) activeMs += gap;
+    }
+    prevT = e.t;
+  });
+  const elapsed = events.length ? events[events.length - 1].t - events[0].t : 0;
+
+  // プロベナンスで正確に集計(削除・部分コピペを反映)
+  let pasted, aiChars;
+  const tags = computeProvenance(events);
+  if (tags && tags.length === total) {
+    pasted = 0;
+    aiChars = 0;
+    for (const t of tags) {
+      if (t === "p") pasted++;else if (t === "a") aiChars++;
+    }
+  } else {
+    // 差分ログを持たない旧データ用のフォールバック(挿入量の累積。上限を総文字数に丸める)
+    pasted = Math.min(legacyPasted, total);
+    aiChars = Math.min(legacyAi, Math.max(0, total - pasted));
+  }
+  return {
+    totalChars: total,
+    pasteChars: pasted,
+    aiChars,
+    typedChars: Math.max(0, total - pasted - aiChars),
+    pasteRate: total ? Math.round(pasted / total * 100) : 0,
+    aiRate: total ? Math.round(aiChars / total * 100) : 0,
+    searches,
+    aiUses,
+    pastes,
+    elapsedMs: elapsed,
+    activeMs
+  };
+}
+
+// ============================================================
+// API設定パネル
+// ============================================================
+function SettingsPanel({
+  settings,
+  onSave,
+  onClose
+}) {
+  const [gemini, setGemini] = useState(settings.geminiKey || "");
+  const [geminiModel, setGeminiModel] = useState(settings.geminiModel || "gemini-2.5-flash");
+  const [g, setG] = useState(settings.googleKey || "");
+  const [cx, setCx] = useState(settings.googleCx || "");
+  const [sync, setSync] = useState(settings.syncUrl || "");
+  const syncLocked = typeof window !== "undefined" && !!window.__SYNC_URL__;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fixed inset-0 bg-stone-900 bg-opacity-40 flex items-center justify-center z-50 p-4",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bg-white rounded-xl shadow-xl max-w-lg w-full p-5 flex flex-col gap-4 max-h-full overflow-auto",
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h2", {
+    className: "font-semibold text-stone-900"
+  }, "API設定"), /*#__PURE__*/React.createElement("div", {
+    className: "bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-xs text-emerald-800"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "font-semibold"
+  }, "キーなしでも使えます:"), " 検索・AIとも「内蔵(無料)」を選べば 設定不要で動作します。GeminiやGoogle検索APIを使いたい場合のみ、以下を設定してください。"), /*#__PURE__*/React.createElement("div", {
+    className: "bg-sky-50 border border-sky-200 rounded-lg p-3 text-xs text-sky-800"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "font-semibold"
+  }, "重要(実行環境について):"), " チャット内のプレビューは セキュリティ制限があり、Gemini / Google APIへは", /*#__PURE__*/React.createElement("span", {
+    className: "font-semibold"
+  }, "キーが正しくても接続できません"), "(プレビューでは「内蔵」を使用)。スタンドアロン版HTMLをブラウザで開けば、", /*#__PURE__*/React.createElement("span", {
+    className: "font-semibold"
+  }, "Geminiキー1つで「Gemini検索」と「Gemini AI」の両方が同時に動作します"), "(Google CSEのキーは不要。逆にスタンドアロン版では「内蔵」は使えません)。"), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-1"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "text-xs font-medium text-violet-700"
+  }, "Gemini API キー(無料枠 / 検索とAIの両方で使用)"), /*#__PURE__*/React.createElement("input", {
+    value: gemini,
+    onChange: e => setGemini(e.target.value),
+    type: "password",
+    placeholder: "AIza...",
+    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-violet-400"
+  }), /*#__PURE__*/React.createElement("label", {
+    className: "text-xs font-medium text-violet-700 mt-1"
+  }, "Geminiモデル"), /*#__PURE__*/React.createElement("select", {
+    value: geminiModel,
+    onChange: e => setGeminiModel(e.target.value),
+    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "gemini-2.5-flash"
+  }, "gemini-2.5-flash(推奨・無料枠)"), /*#__PURE__*/React.createElement("option", {
+    value: "gemini-2.5-flash-lite"
+  }, "gemini-2.5-flash-lite(軽量・無料枠)"), /*#__PURE__*/React.createElement("option", {
+    value: "gemini-2.0-flash"
+  }, "gemini-2.0-flash")), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, "aistudio.google.com にGoogleアカウントでログイン →「Get API key」→「APIキーを作成」で 無料で取得できます(クレジットカード不要)。")), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-1 border-t border-stone-100 pt-3"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "text-xs font-medium text-sky-700"
+  }, "Google検索 APIキー(Custom Search JSON API / 任意・通常は不要)"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, "※検索は「内蔵検索」または「Gemini検索」で動くため、この設定は必須ではありません。"), /*#__PURE__*/React.createElement("input", {
+    value: g,
+    onChange: e => setG(e.target.value),
+    type: "password",
+    placeholder: "AIza...",
+    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-400"
+  }), /*#__PURE__*/React.createElement("label", {
+    className: "text-xs font-medium text-sky-700 mt-1"
+  }, "検索エンジンID (cx)"), /*#__PURE__*/React.createElement("input", {
+    value: cx,
+    onChange: e => setCx(e.target.value),
+    placeholder: "0123456789abc...",
+    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-400"
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "text-xs text-stone-400 leading-relaxed"
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "font-medium text-stone-500"
+  }, "「ウェブ全体を検索」が作成画面で選べない場合:"), /*#__PURE__*/React.createElement("p", null, "① 作成画面の「検索の対象」に仮のサイト(例: example.com)を入力していったん作成 → ② コントロールパネルで作成したエンジンを開き、[概要] 内の「検索の設定」にある 「", /*#__PURE__*/React.createElement("span", {
+    className: "font-medium"
+  }, "ウェブ全体を検索"), "」をオンにする(反映は即時) → ③ 不要なら追加した仮サイトを削除。"), /*#__PURE__*/React.createElement("p", {
+    className: "mt-1 text-amber-700"
+  }, "※Custom Search JSON APIは新規受付を終了していると案内される場合があります。 利用できない場合は「内蔵検索(無料)」をご利用ください。"))), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-1 border-t border-stone-100 pt-3"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "text-xs font-medium text-emerald-700"
+  }, "共有データベースURL(複数人での実運用時に設定)"), syncLocked ? /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-emerald-700 bg-emerald-50 rounded-lg p-2 break-all"
+  }, "このアプリは配布時に共有DBが設定済みです: ", window.__SYNC_URL__) : /*#__PURE__*/React.createElement("input", {
+    value: sync,
+    onChange: e => setSync(e.target.value),
+    placeholder: "https://xxxx-default-rtdb.firebaseio.com",
+    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-emerald-400"
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "text-xs text-stone-400 leading-relaxed"
+  }, /*#__PURE__*/React.createElement("p", null, "未設定の場合、データはこのブラウザ内にのみ保存されます(1人での試用向け)。 学生と教員が別々のPCで使うには、Firebase Realtime Database(無料枠)を共有DBとして設定します:"), /*#__PURE__*/React.createElement("p", null, "① console.firebase.google.com でプロジェクト作成 → ② 構築 > Realtime Database を「テストモード」で作成 → ③ 表示されるURL(https://…firebaseio.com)を上に貼るか、配布用HTML冒頭の window.__SYNC_URL__ に記入して全員に配布。"), /*#__PURE__*/React.createElement("p", {
+    className: "text-amber-700 mt-1"
+  }, "※テストモードは誰でも読み書き可能な状態です。授業での本運用時はFirebase側でセキュリティルールを設定してください。"))), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-amber-700 bg-amber-50 rounded-lg p-2"
+  }, "注意: このプロトタイプではキーをブラウザ内に保存します。 本番運用ではキーはサーバ側で保持する構成にしてください。"), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 justify-end"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    className: "px-4 py-2 text-sm text-stone-500 hover:text-stone-800"
+  }, "閉じる"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => onSave({
+      geminiKey: gemini.trim(),
+      geminiModel,
+      googleKey: g.trim(),
+      googleCx: cx.trim(),
+      syncUrl: sync.trim()
+    }),
+    className: "px-5 py-2 bg-stone-900 text-white text-sm rounded-lg hover:bg-stone-700"
+  }, "保存"))));
+}
+
+// ============================================================
+// 検索結果カード
+// リンク切れ・リダイレクトURL・埋め込み環境のリンク制限に備え、
+// (1) URLの妥当性検証、(2) リンクのコピー、(3) Google検索で開く予備手段 を提供
+// ============================================================
+function isValidUrl(u) {
+  return typeof u === "string" && /^https?:\/\/.+/.test(u);
+}
+function googleSearchUrl(q) {
+  return "https://www.google.com/search?q=" + encodeURIComponent(q || "");
+}
+function SearchResultCard({
+  item,
+  onQuote
+}) {
+  const [copied, setCopied] = useState(false);
+  const valid = isValidUrl(item.link);
+  const href = valid ? item.link : googleSearchUrl(item.title);
+  const copyLink = async () => {
+    const target = valid ? item.link : googleSearchUrl(item.title);
+    let ok = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(target);
+        ok = true;
+      }
+    } catch (e) {}
+    if (!ok) {
+      // フォールバック(clipboard APIが使えない環境)
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = target;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        ok = true;
+      } catch (e) {}
+    }
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "border border-stone-200 rounded-lg p-3 hover:border-sky-300"
+  }, /*#__PURE__*/React.createElement("a", {
+    href: href,
+    target: "_blank",
+    rel: "noopener noreferrer",
+    className: "text-sm font-medium text-sky-700 hover:underline break-all"
+  }, item.title || "(タイトルなし)"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400 break-all"
+  }, valid ? item.link : "(URL不明のためGoogle検索リンクを使用)"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-600 mt-1"
+  }, item.snippet), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 mt-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => onQuote(item.snippet),
+    className: "text-xs text-amber-700 border border-amber-300 rounded px-2 py-1 hover:bg-amber-50"
+  }, "スニペットを本文に引用(コピペとして記録)"), /*#__PURE__*/React.createElement("button", {
+    onClick: copyLink,
+    className: "text-xs text-stone-600 border border-stone-300 rounded px-2 py-1 hover:bg-stone-50"
+  }, copied ? "コピーしました✓" : "リンクをコピー"), /*#__PURE__*/React.createElement("a", {
+    href: googleSearchUrl(item.title),
+    target: "_blank",
+    rel: "noopener noreferrer",
+    className: "text-xs text-sky-600 border border-sky-200 rounded px-2 py-1 hover:bg-sky-50"
+  }, "Googleで開く")));
+}
+
+// ============================================================
+// 学生: エディタ + ログ記録
+// ============================================================
+function StudentEditor({
+  studentName,
+  settings,
+  onSubmitted,
+  onOpenSettings
+}) {
+  const [title, setTitle] = useState("");
+  const [text, setText] = useState("");
+  const [tab, setTab] = useState("search");
+  // スタンドアロン版では外部API(Gemini/Google)が使え、内蔵が使えないため既定を切替
+  const [searchProvider, setSearchProvider] = useState(STANDALONE ? "gemini" : "builtin"); // builtin | gemini | google
+  const [aiProvider, setAiProvider] = useState(STANDALONE ? "gemini" : "builtin"); // builtin | gemini
+  const [query, setQuery] = useState("");
+  const [searchItems, setSearchItems] = useState(null);
+  const [searchErr, setSearchErr] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiResult, setAiResult] = useState("");
+  const [aiErr, setAiErr] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [submitStatus, setSubmitStatus] = useState({
+    state: "idle",
+    msg: ""
+  });
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(null);
+  const eventsRef = useRef([]);
+  const prevTextRef = useRef("");
+  const taRef = useRef(null);
+  const pasteInfoRef = useRef(null);
+  const aiOutputsRef = useRef([]); // このセッションでAIが出力した回答(部分コピペ検出用)
+
+  // 貼り付けられたテキストがAIの回答(の一部)かを判定
+  const isFromAI = pasted => {
+    const t = (pasted || "").trim();
+    if (t.length < 8) return false; // 短すぎる断片は判定しない
+    return aiOutputsRef.current.some(out => out.includes(t) || t.includes(out));
+  };
+  const now = () => Date.now() - (startRef.current || Date.now());
+  const pushEvent = useCallback(ev => {
+    if (!startRef.current) {
+      startRef.current = Date.now();
+      eventsRef.current.push({
+        t: 0,
+        type: "start",
+        snapshot: ""
+      });
+    }
+    ev.t = now();
+    const evs = eventsRef.current;
+    const last = evs[evs.length - 1];
+    if (ev.type === "edit" && last && last.type === "edit" && ev.t - last.t < 600 && last._base != null) {
+      ev.d = makeDiff(last._base, ev._new);
+      ev._base = last._base;
+      evs[evs.length - 1] = ev;
+    } else {
+      evs.push(ev);
+    }
+    if (evs.length % 40 === 0 && ev._new != null) ev.snapshot = ev._new;
+  }, []);
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (startRef.current) setElapsed(Date.now() - startRef.current);
+    }, 1000);
+    return () => clearInterval(iv);
+  }, []);
+  const recordTextChange = (newText, type, extra) => {
+    const oldText = prevTextRef.current;
+    const d = makeDiff(oldText, newText);
+    pushEvent({
+      type,
+      d,
+      len: newText.length,
+      _base: oldText,
+      _new: newText,
+      ...extra
+    });
+    prevTextRef.current = newText;
+  };
+  const handleChange = e => {
+    const v = e.target.value;
+    if (pasteInfoRef.current) {
+      const p = pasteInfoRef.current;
+      pasteInfoRef.current = null;
+      // AIパネルの回答(の一部)をコピペした場合は AI由来(src:"ai")として記録
+      const extra = {
+        text: p.text,
+        pos: p.pos
+      };
+      if (isFromAI(p.text)) extra.src = "ai";
+      recordTextChange(v, "paste", extra);
+    } else {
+      recordTextChange(v, "edit", {
+        cursor: e.target.selectionStart
+      });
+    }
+    setText(v);
+  };
+  const handlePaste = e => {
+    const t = e.clipboardData.getData("text");
+    pasteInfoRef.current = {
+      text: t,
+      pos: e.target.selectionStart
+    };
+  };
+  const runSearch = async () => {
+    if (!query.trim() || searching) return;
+    setSearching(true);
+    setSearchErr("");
+    setSearchItems(null);
+    pushEvent({
+      type: "search",
+      query,
+      provider: searchProvider
+    });
+    try {
+      const items = searchProvider === "google" ? await callGoogleSearch(query, settings) : searchProvider === "gemini" ? await callGeminiSearch(query, settings) : await callBuiltinSearch(query);
+      setSearchItems(items);
+      pushEvent({
+        type: "searchResult",
+        query,
+        resultCount: items.length
+      });
+    } catch (err) {
+      if (err.message === "NO_KEY") {
+        setSearchErr(searchProvider === "gemini" ? "Gemini APIキーが未設定です。「API設定」から入力してください(Geminiキー1つで検索とAIの両方が使えます)。" : "Google APIキーと検索エンジンID(cx)が未設定です。「API設定」から入力するか、他の検索に切り替えてください。");
+      } else if (err.message === "NETWORK_BLOCKED") {
+        setSearchErr("このチャット内プレビューでは、セキュリティ制限により外部サービス(Gemini/Google)への直接接続がブロックされています。キーが正しくても接続できません。ここでは「内蔵検索(無料)」をご利用ください。Gemini検索・Google APIはスタンドアロン版(ダウンロードしたHTMLをブラウザで開く)で動作します。");
+        setSearchProvider("builtin");
+      } else if (err.message === "BUILTIN_UNAVAILABLE") {
+        setSearchErr("内蔵検索はチャット内プレビュー専用のため、この環境では使用できません。「Gemini検索(無料枠)」に切り替えてご利用ください(GeminiキーでOK、Google CSEのキーは不要です)。");
+      } else {
+        setSearchErr("検索エラー: " + err.message);
+      }
+    }
+    setSearching(false);
+  };
+  const runAI = async () => {
+    if (!aiPrompt.trim() || aiLoading) return;
+    setAiLoading(true);
+    setAiErr("");
+    setAiResult("");
+    pushEvent({
+      type: "ai",
+      prompt: aiPrompt,
+      provider: aiProvider
+    });
+    try {
+      const r = aiProvider === "gemini" ? await callGemini(aiPrompt, text, settings) : await callBuiltinAI(aiPrompt, text);
+      setAiResult(r || "(空の応答)");
+      if (r) aiOutputsRef.current.push(r); // 部分コピペ検出のため回答を記憶
+      pushEvent({
+        type: "aiResult",
+        prompt: aiPrompt,
+        resultLen: (r || "").length
+      });
+    } catch (err) {
+      if (err.message === "NO_KEY") {
+        setAiErr("Gemini APIキーが未設定です。「API設定」から入力するか、「内蔵AI(無料)」に切り替えてください。");
+      } else if (err.message === "NETWORK_BLOCKED") {
+        setAiErr("このチャット内プレビューでは、セキュリティ制限により外部サービス(Gemini API)への直接接続がブロックされています。APIキーが正しくても接続できません。ここでは「内蔵AI(無料)」をご利用ください。Geminiはスタンドアロン版(ダウンロードしたHTMLをブラウザで開く)で動作します。");
+        setAiProvider("builtin");
+      } else if (err.message === "BUILTIN_UNAVAILABLE") {
+        setAiErr("内蔵AIはチャット内プレビュー専用のため、この環境では使用できません。「Gemini(無料枠)」に切り替えてご利用ください。");
+      } else {
+        setAiErr("AIエラー: " + err.message);
+      }
+    }
+    setAiLoading(false);
+  };
+  const insertAI = () => {
+    if (!aiResult || aiLoading) return;
+    const ta = taRef.current;
+    const pos = ta ? ta.selectionStart : text.length;
+    const v = text.slice(0, pos) + aiResult + text.slice(pos);
+    recordTextChange(v, "aiInsert", {
+      text: aiResult,
+      pos
+    });
+    setText(v);
+  };
+  const insertToReport = str => {
+    const v = text + (text ? "\n" : "") + str;
+    recordTextChange(v, "paste", {
+      text: str,
+      pos: text.length
+    });
+    setText(v);
+  };
+  const submit = async () => {
+    if (!title.trim() || !text.trim()) {
+      setSubmitStatus({
+        state: "error",
+        msg: "タイトルと本文を入力してから提出してください。"
+      });
+      return;
+    }
+    setSubmitStatus({
+      state: "saving",
+      msg: "提出中…"
+    });
+    try {
+      pushEvent({
+        type: "submit",
+        snapshot: text,
+        len: text.length
+      });
+      const events = eventsRef.current.map(e => {
+        const {
+          _base,
+          _new,
+          ...rest
+        } = e;
+        return rest;
+      });
+      const stats = computeStats(events, text);
+      const sub = {
+        id: uid(),
+        student: studentName || "無名",
+        title,
+        text,
+        events,
+        stats,
+        submittedAt: new Date().toISOString(),
+        shared: false
+      };
+      const r = await saveSubmission(sub);
+      // --- 生成過程NFTのミント(ブロックチェーンへ記録) ---
+      let nftMsg = "";
+      try {
+        const contentHash = await submissionContentHash(sub);
+        const tokenId = "RPP-" + uid().toUpperCase();
+        const block = await addBlock({
+          type: "MINT",
+          tokenId,
+          subId: sub.id,
+          owner: didOf(sub.student),
+          ownerName: sub.student,
+          title: sub.title,
+          contentHash
+        });
+        sub.nftTokenId = tokenId;
+        sub.contentHash = contentHash;
+        sub.nftBlockIndex = block.index;
+        await saveSubmission(sub);
+        nftMsg = " 生成過程NFT(" + tokenId + ")をブロック#" + block.index + "としてチェーンに記録しました。";
+      } catch (e) {
+        console.error("NFTミント失敗:", e);
+        nftMsg = " (NFTのミントに失敗しましたが、提出自体は完了しています)";
+      }
+      setSubmitStatus({
+        state: "done",
+        msg: (r.persisted ? "提出しました。教員モードで生成過程を再生できます。" : "提出しました(注意: 永続ストレージに書き込めなかったため、このセッション内でのみ保持されます)。") + nftMsg
+      });
+      onSubmitted(sub);
+    } catch (err) {
+      console.error(err);
+      setSubmitStatus({
+        state: "error",
+        msg: "提出に失敗しました: " + (err.message || err)
+      });
+    }
+  };
+  const liveStats = computeStats(eventsRef.current, text);
+  const providerBtn = active => "px-2 py-1 text-xs rounded " + (active ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500 hover:bg-stone-200");
+  return /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-1 lg:grid-cols-3 gap-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lg:col-span-2 bg-white rounded-xl border border-stone-200 shadow-sm flex flex-col"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "px-4 py-3 border-b border-stone-100 flex items-center gap-3"
+  }, /*#__PURE__*/React.createElement("input", {
+    className: "flex-1 text-lg font-semibold text-stone-900 placeholder-stone-300 outline-none",
+    placeholder: "レポートのタイトル",
+    value: title,
+    onChange: e => setTitle(e.target.value)
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs font-mono text-stone-400"
+  }, text.length, "字 / ", fmtClock(elapsed))), /*#__PURE__*/React.createElement("textarea", {
+    ref: taRef,
+    value: text,
+    onChange: handleChange,
+    onPaste: handlePaste,
+    placeholder: "ここに本文を書き始めると、執筆・コピペ・検索・AI利用のすべてが時系列で記録されます。",
+    className: "flex-1 min-h-96 p-4 text-stone-800 leading-relaxed outline-none resize-none"
+  }), submitStatus.state !== "idle" && /*#__PURE__*/React.createElement("div", {
+    className: "mx-4 mb-2 px-3 py-2 rounded-lg text-sm " + (submitStatus.state === "error" ? "bg-red-50 text-red-700 border border-red-200" : submitStatus.state === "done" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-stone-50 text-stone-600 border border-stone-200")
+  }, submitStatus.msg), /*#__PURE__*/React.createElement("div", {
+    className: "px-4 py-3 border-t border-stone-100 flex items-center justify-between flex-wrap gap-2"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3 text-xs"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-emerald-700"
+  }, "手入力 ", liveStats.typedChars, "字"), /*#__PURE__*/React.createElement("span", {
+    className: "text-amber-700"
+  }, "コピペ ", liveStats.pasteChars, "字"), /*#__PURE__*/React.createElement("span", {
+    className: "text-violet-700"
+  }, "AI由来 ", liveStats.aiChars, "字"), /*#__PURE__*/React.createElement("span", {
+    className: "text-sky-700"
+  }, "検索 ", liveStats.searches, "回")), /*#__PURE__*/React.createElement("button", {
+    onClick: submit,
+    disabled: submitStatus.state === "saving",
+    className: "px-5 py-2 bg-stone-900 text-white text-sm font-medium rounded-lg hover:bg-stone-700 disabled:opacity-50"
+  }, submitStatus.state === "saving" ? "提出中…" : "レポートを提出"))), /*#__PURE__*/React.createElement("div", {
+    className: "bg-white rounded-xl border border-stone-200 shadow-sm flex flex-col"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex border-b border-stone-100"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTab("search"),
+    className: "flex-1 py-3 text-sm font-medium " + (tab === "search" ? "text-sky-700 border-b-2 border-sky-500" : "text-stone-400")
+  }, "Web検索"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTab("ai"),
+    className: "flex-1 py-3 text-sm font-medium " + (tab === "ai" ? "text-violet-700 border-b-2 border-violet-500" : "text-stone-400")
+  }, "生成AI")), tab === "search" ? /*#__PURE__*/React.createElement("div", {
+    className: "p-4 flex flex-col gap-3 flex-1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 text-xs text-stone-400 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", null, "検索エンジン:"), /*#__PURE__*/React.createElement("button", {
+    className: providerBtn(searchProvider === "builtin"),
+    onClick: () => setSearchProvider("builtin")
+  }, "内蔵検索(無料)"), /*#__PURE__*/React.createElement("button", {
+    className: providerBtn(searchProvider === "gemini"),
+    onClick: () => setSearchProvider("gemini")
+  }, "Gemini検索(無料枠)"), /*#__PURE__*/React.createElement("button", {
+    className: providerBtn(searchProvider === "google"),
+    onClick: () => setSearchProvider("google")
+  }, "Google CSE")), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("input", {
+    className: "flex-1 border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-400",
+    placeholder: "検索キーワード",
+    value: query,
+    onChange: e => setQuery(e.target.value),
+    onKeyDown: e => e.key === "Enter" && runSearch()
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: runSearch,
+    disabled: searching,
+    className: "px-4 py-2 bg-sky-600 text-white text-sm rounded-lg hover:bg-sky-500 disabled:opacity-50"
+  }, searching ? "…" : "検索")), /*#__PURE__*/React.createElement("div", {
+    className: "flex-1 overflow-auto flex flex-col gap-2 min-h-48"
+  }, searching && /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-stone-400"
+  }, "検索中…", searchProvider === "builtin" ? "(内蔵検索は数秒かかります)" : ""), searchErr && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3"
+  }, searchErr, searchErr.includes("未設定") && /*#__PURE__*/React.createElement("button", {
+    onClick: onOpenSettings,
+    className: "block mt-2 text-sky-700 underline"
+  }, "API設定を開く")), searchItems && searchItems.length === 0 && /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-stone-400"
+  }, "結果が見つかりませんでした。"), searchItems && searchItems.map((it, i) => /*#__PURE__*/React.createElement(SearchResultCard, {
+    key: i,
+    item: it,
+    onQuote: insertToReport
+  })), searchItems && searchItems.length > 0 && /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, "※リンクをクリックして開けない場合(埋め込み画面の制限や、AIが返したURLのリンク切れ)は、 「リンクをコピー」してブラウザのアドレスバーに貼り付けるか、「Googleで開く」をご利用ください。"), !searchItems && !searchErr && !searching && /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-stone-400 bg-stone-50 rounded-lg p-3"
+  }, "内蔵検索はキー設定なしで今すぐ使えます。検索の実行はすべてログに記録されます。"))) : /*#__PURE__*/React.createElement("div", {
+    className: "p-4 flex flex-col gap-3 flex-1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 text-xs text-stone-400"
+  }, /*#__PURE__*/React.createElement("span", null, "AIモデル:"), /*#__PURE__*/React.createElement("button", {
+    className: providerBtn(aiProvider === "builtin"),
+    onClick: () => setAiProvider("builtin")
+  }, "内蔵AI(無料)"), /*#__PURE__*/React.createElement("button", {
+    className: providerBtn(aiProvider === "gemini"),
+    onClick: () => setAiProvider("gemini")
+  }, "Gemini(無料枠)")), /*#__PURE__*/React.createElement("textarea", {
+    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-violet-400 resize-none h-20",
+    placeholder: "AIへの依頼(例: 序論の構成案を出して)",
+    value: aiPrompt,
+    onChange: e => setAiPrompt(e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: runAI,
+    disabled: aiLoading,
+    className: "flex-1 px-4 py-2 bg-violet-600 text-white text-sm rounded-lg hover:bg-violet-500 disabled:opacity-50"
+  }, aiLoading ? "生成中…" : "AIに依頼"), /*#__PURE__*/React.createElement("button", {
+    onClick: insertAI,
+    disabled: !aiResult || aiLoading,
+    className: "px-4 py-2 border border-violet-300 text-violet-700 text-sm rounded-lg hover:bg-violet-50 disabled:opacity-40"
+  }, "本文に挿入")), aiErr && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3"
+  }, aiErr, aiErr.includes("未設定") && /*#__PURE__*/React.createElement("button", {
+    onClick: onOpenSettings,
+    className: "block mt-2 text-violet-700 underline"
+  }, "API設定を開く")), /*#__PURE__*/React.createElement("div", {
+    className: "flex-1 overflow-auto text-sm text-stone-700 whitespace-pre-wrap bg-stone-50 rounded-lg p-3 min-h-40"
+  }, aiResult || !aiErr && "内蔵AIはキー設定なしで無料で使えます。Gemini無料枠を使う場合はAPI設定でキーを入力してください。利用回数・タイミング・挿入箇所はすべて記録されます。"))));
+}
+
+// ============================================================
+// 生成過程プレーヤー (追体験ビュー)
+// ============================================================
+function ProcessPlayer({
+  submission
+}) {
+  const events = submission.events || [];
+  const [idx, setIdx] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(8);
+  const timerRef = useRef(null);
+  const duration = events.length ? events[events.length - 1].t : 0;
+  const texts = useMemo(() => {
+    let cur = "";
+    return events.map(e => {
+      if (e.snapshot != null) cur = e.snapshot;else if (e.d) cur = applyDiff(cur, e.d);
+      return cur;
+    });
+  }, [events]);
+  const currentText = texts[idx] || "";
+  const insertedSoFar = useMemo(() => {
+    const arr = [];
+    for (let i = 0; i <= idx; i++) {
+      const e = events[i];
+      if (e && (e.type === "paste" || e.type === "aiInsert") && e.text) {
+        arr.push({
+          text: e.text,
+          type: e.type === "paste" && e.src === "ai" ? "aiInsert" : e.type
+        });
+      }
+    }
+    return arr;
+  }, [idx, events]);
+  const rendered = useMemo(() => {
+    let segments = [{
+      text: currentText,
+      mark: null
+    }];
+    insertedSoFar.forEach(ins => {
+      const next = [];
+      segments.forEach(seg => {
+        if (seg.mark || !ins.text || ins.text.length < 4) {
+          next.push(seg);
+          return;
+        }
+        const p = seg.text.indexOf(ins.text);
+        if (p === -1) {
+          next.push(seg);
+          return;
+        }
+        if (p > 0) next.push({
+          text: seg.text.slice(0, p),
+          mark: null
+        });
+        next.push({
+          text: ins.text,
+          mark: ins.type
+        });
+        if (p + ins.text.length < seg.text.length) next.push({
+          text: seg.text.slice(p + ins.text.length),
+          mark: null
+        });
+      });
+      segments = next;
+    });
+    return segments;
+  }, [currentText, insertedSoFar]);
+  useEffect(() => {
+    if (!playing) return;
+    if (idx >= events.length - 1) {
+      setPlaying(false);
+      return;
+    }
+    const cur = events[idx].t;
+    const nxt = events[idx + 1].t;
+    const wait = Math.min(Math.max((nxt - cur) / speed, 30), 1500);
+    timerRef.current = setTimeout(() => setIdx(i => i + 1), wait);
+    return () => clearTimeout(timerRef.current);
+  }, [playing, idx, speed, events]);
+  const cur = events[idx] || {};
+  const meta = EVENT_META[cur.type] || EVENT_META.edit;
+  const counters = useMemo(() => {
+    let s = 0,
+      a = 0,
+      p = 0;
+    for (let i = 0; i <= idx; i++) {
+      const e = events[i];
+      if (!e) continue;
+      if (e.type === "search") s++;
+      if (e.type === "ai") a++;
+      if (e.type === "paste") p++;
+    }
+    return {
+      s,
+      a,
+      p
+    };
+  }, [idx, events]);
+  const describe = (e, i) => {
+    if (!e) return "";
+    const len = texts[i] != null ? texts[i].length : 0;
+    switch (e.type) {
+      case "start":
+        return "執筆セッション開始";
+      case "edit":
+        return "執筆中 (" + len + "字)";
+      case "paste":
+        return (e.src === "ai" ? "AIの回答をコピペ: 「" : "コピペ: 「") + (e.text || "").slice(0, 40) + ((e.text || "").length > 40 ? "…" : "") + "」(" + (e.text || "").length + "字) を位置" + e.pos + "に貼り付け" + (e.src === "ai" ? " ※AI由来として算入" : "");
+      case "search":
+        return "Web検索: 「" + e.query + "」" + (e.provider === "google" ? " (Google CSE)" : e.provider === "gemini" ? " (Gemini検索)" : "");
+      case "searchResult":
+        return "検索結果を閲覧 (「" + e.query + "」 " + (e.resultCount != null ? e.resultCount + "件" : "") + ")";
+      case "ai":
+        return "AIに依頼: 「" + (e.prompt || "").slice(0, 40) + "」" + (e.provider === "gemini" ? " (Gemini)" : "");
+      case "aiResult":
+        return "AIの回答を閲覧";
+      case "aiInsert":
+        return "AIの回答(" + (e.text || "").length + "字)を位置" + e.pos + "に挿入";
+      case "submit":
+        return "レポート提出";
+      default:
+        return e.type;
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-3 flex-wrap"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      if (idx >= events.length - 1) setIdx(0);
+      setPlaying(!playing);
+    },
+    className: "px-4 py-2 bg-stone-900 text-white text-sm rounded-lg hover:bg-stone-700 w-24"
+  }, playing ? "一時停止" : "▶ 再生"), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-1"
+  }, [2, 8, 32].map(s => /*#__PURE__*/React.createElement("button", {
+    key: s,
+    onClick: () => setSpeed(s),
+    className: "px-2 py-1 text-xs rounded " + (speed === s ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500")
+  }, "×", s))), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs font-mono text-stone-500"
+  }, fmtClock(cur.t || 0), " / ", fmtClock(duration), "(イベント ", idx + 1, "/", events.length, ")"), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3 text-xs ml-auto"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-sky-700"
+  }, "検索 ", counters.s), /*#__PURE__*/React.createElement("span", {
+    className: "text-violet-700"
+  }, "AI ", counters.a), /*#__PURE__*/React.createElement("span", {
+    className: "text-amber-700"
+  }, "コピペ ", counters.p))), /*#__PURE__*/React.createElement("div", {
+    className: "relative h-8 bg-stone-100 rounded-lg cursor-pointer select-none",
+    onClick: e => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const ratio = (e.clientX - rect.left) / rect.width;
+      setIdx(Math.min(events.length - 1, Math.max(0, Math.round(ratio * (events.length - 1)))));
+    }
+  }, events.map((e, i) => {
+    if (!duration) return null;
+    if (e.type === "edit" || e.type === "searchResult" || e.type === "aiResult") return null;
+    const m = EVENT_META[e.type];
+    if (!m) return null;
+    return /*#__PURE__*/React.createElement("div", {
+      key: i,
+      title: describe(e, i),
+      className: "absolute top-1 bottom-1 w-1 rounded " + m.color,
+      style: {
+        left: e.t / duration * 100 + "%"
+      }
+    });
+  }), events.map((e, i) => {
+    if (e.type !== "edit" || !duration) return null;
+    return /*#__PURE__*/React.createElement("div", {
+      key: "e" + i,
+      className: "absolute bottom-1 w-0.5 h-1.5 bg-emerald-300",
+      style: {
+        left: e.t / duration * 100 + "%"
+      }
+    });
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "absolute top-0 bottom-0 w-0.5 bg-stone-900",
+    style: {
+      left: (duration ? (cur.t || 0) / duration * 100 : 0) + "%"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "rounded-lg px-4 py-2 text-sm ring-1 " + meta.ring + " bg-white flex items-center gap-2"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "w-2.5 h-2.5 rounded-full " + meta.color
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "font-medium " + meta.text
+  }, meta.label), /*#__PURE__*/React.createElement("span", {
+    className: "text-stone-600 truncate"
+  }, describe(cur, idx))), /*#__PURE__*/React.createElement("div", {
+    className: "bg-white border border-stone-200 rounded-xl p-4 min-h-64 max-h-96 overflow-auto leading-relaxed text-stone-800 whitespace-pre-wrap text-sm"
+  }, rendered.map((seg, i) => seg.mark ? /*#__PURE__*/React.createElement("mark", {
+    key: i,
+    className: seg.mark === "paste" ? "bg-amber-100 text-amber-900 rounded px-0.5" : "bg-violet-100 text-violet-900 rounded px-0.5"
+  }, seg.text) : /*#__PURE__*/React.createElement("span", {
+    key: i
+  }, seg.text)), !currentText && /*#__PURE__*/React.createElement("span", {
+    className: "text-stone-300"
+  }, "(まだ本文がありません)")), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-4 text-xs text-stone-500"
+  }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("span", {
+    className: "inline-block w-3 h-3 bg-amber-100 border border-amber-300 rounded align-middle mr-1"
+  }), "コピペ由来"), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("span", {
+    className: "inline-block w-3 h-3 bg-violet-100 border border-violet-300 rounded align-middle mr-1"
+  }), "AI由来"), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("span", {
+    className: "inline-block w-3 h-3 bg-white border border-stone-300 rounded align-middle mr-1"
+  }), "手入力")));
+}
+
+// ============================================================
+// NFT情報カード(提出物の詳細画面用)
+// ============================================================
+function NftCard({
+  submission
+}) {
+  const [status, setStatus] = useState(null); // {token, integrity: 'ok'|'tampered'|'nohash'}
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const tokens = await chainTokens();
+        const token = submission.nftTokenId ? tokens[submission.nftTokenId] : null;
+        let integrity = "nohash";
+        if (token && token.contentHash) {
+          const h = await submissionContentHash(submission);
+          integrity = h === token.contentHash ? "ok" : "tampered";
+        }
+        setStatus({
+          token,
+          integrity
+        });
+      } catch (e) {
+        setStatus({
+          token: null,
+          integrity: "nohash"
+        });
+      }
+    })();
+  }, [submission]);
+  if (!status) return /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, "NFT情報を照会中…");
+  if (!status.token) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "bg-white border border-stone-200 rounded-xl p-3 text-xs text-stone-400"
+    }, "この提出物にはNFTが発行されていません(NFT機能追加以前の提出物、またはミント失敗)。");
+  }
+  const t = status.token;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "bg-white border border-indigo-200 rounded-xl p-4 flex flex-col gap-1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-xs font-semibold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full"
+  }, "生成過程NFT"), /*#__PURE__*/React.createElement("span", {
+    className: "font-mono text-sm text-stone-800"
+  }, t.tokenId), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs text-stone-400"
+  }, "ブロック#", t.blockIndex, " に記録"), status.integrity === "ok" && /*#__PURE__*/React.createElement("span", {
+    className: "text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full"
+  }, "✓ 整合性検証OK(改ざんなし)"), status.integrity === "tampered" && /*#__PURE__*/React.createElement("span", {
+    className: "text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full"
+  }, "⚠ 改ざん検出: 保存データがチェーン上のハッシュと不一致")), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400 font-mono break-all"
+  }, "contentHash: ", t.contentHash), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-500"
+  }, "発行者: ", t.creatorName, "(", t.creator, ") / 保有者: ", t.owners.length, "名", t.shared ? " / マーケットに公開中" : ""));
+}
+
+// ============================================================
+// ブロックチェーンエクスプローラ
+// ============================================================
+function BlockchainView({
+  viewerName
+}) {
+  const [chain, setChain] = useState([]);
+  const [verifyResult, setVerifyResult] = useState(null);
+  const [verifying, setVerifying] = useState(false);
+  const [anchors, setAnchors] = useState([]);
+  const [anchorMsg, setAnchorMsg] = useState("");
+  const [anchoring, setAnchoring] = useState(false);
+  const reload = useCallback(async () => {
+    setChain(await loadChain());
+    setAnchors(await loadAnchors());
+  }, []);
+  useEffect(() => {
+    reload();
+  }, [reload]);
+  const runVerify = async () => {
+    setVerifying(true);
+    setVerifyResult(null);
+    // (1) チェーン自体の整合性
+    const res = await verifyChain();
+    // (2) 各NFTのcontentHashと保存中の提出データの照合(改ざん検出)
+    const tokens = await chainTokens();
+    const dataProblems = [];
+    for (const id of Object.keys(tokens)) {
+      const t = tokens[id];
+      const sub = await loadSubmission(t.subId);
+      if (!sub) {
+        dataProblems.push(t.tokenId + ": 対応する提出データが見つかりません");
+        continue;
+      }
+      const h = await submissionContentHash(sub);
+      if (h !== t.contentHash) dataProblems.push(t.tokenId + ": 提出データがチェーン上のハッシュと不一致(改ざんの可能性)");
+    }
+    setVerifyResult({
+      ...res,
+      dataProblems,
+      tokenCount: Object.keys(tokens).length
+    });
+    setVerifying(false);
+  };
+  const runAnchor = async () => {
+    if (chain.length === 0) {
+      setAnchorMsg("チェーンが空です。先にレポートを提出してNFTを発行してください。");
+      return;
+    }
+    setAnchoring(true);
+    setAnchorMsg("");
+    try {
+      const latest = chain[chain.length - 1];
+      const {
+        txHash,
+        from
+      } = await anchorToEthereum(latest.hash);
+      const anchor = {
+        blockIndex: latest.index,
+        blockHash: latest.hash,
+        txHash,
+        from,
+        at: new Date().toISOString()
+      };
+      await saveAnchor(anchor);
+      setAnchors(await loadAnchors());
+      setAnchorMsg("ブロック#" + latest.index + " のハッシュをEthereum(Sepolia)に記録しました。Tx: " + txHash);
+    } catch (e) {
+      if (e.message === "NO_WALLET") {
+        setAnchorMsg(STANDALONE ? "MetaMask等のウォレット拡張機能が見つかりません。ブラウザにMetaMaskをインストールし、Sepoliaテストネットを選択してから再実行してください(テスト用ETHはfaucetで無料入手できます)。" : "実チェーンへの記録はスタンドアロン版でのみ利用できます(このプレビュー環境ではウォレットに接続できません)。ローカルチェーンとNFTはこの環境でも動作しています。");
+      } else {
+        setAnchorMsg("記録に失敗しました: " + (e.message || e));
+      }
+    }
+    setAnchoring(false);
+  };
+  const typeLabel = d => {
+    switch ((d || {}).type) {
+      case "GENESIS":
+        return {
+          label: "創世",
+          cls: "bg-stone-200 text-stone-600"
+        };
+      case "MINT":
+        return {
+          label: "NFT発行",
+          cls: "bg-indigo-100 text-indigo-700"
+        };
+      case "SHARE":
+        return {
+          label: "共有設定",
+          cls: "bg-emerald-100 text-emerald-700"
+        };
+      case "ACQUIRE":
+        return {
+          label: "NFT取得",
+          cls: "bg-amber-100 text-amber-700"
+        };
+      default:
+        return {
+          label: (d || {}).type || "?",
+          cls: "bg-stone-100 text-stone-500"
+        };
+    }
+  };
+  const describeBlock = d => {
+    if (!d) return "";
+    if (d.type === "GENESIS") return d.note || "";
+    if (d.type === "MINT") return d.ownerName + " が「" + d.title + "」の生成過程NFT " + d.tokenId + " を発行";
+    if (d.type === "SHARE") return d.tokenId + " を" + (d.shared ? "マーケットに公開" : "非公開に変更") + "(教員)";
+    if (d.type === "ACQUIRE") return d.ownerName + " が " + d.tokenId + " を取得(追体験権)";
+    return JSON.stringify(d);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-3 flex-wrap"
+  }, /*#__PURE__*/React.createElement("h2", {
+    className: "text-lg font-semibold text-stone-900"
+  }, "ブロックチェーン"), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs text-stone-400"
+  }, "ブロック数: ", chain.length, " / あなたのDID: ", /*#__PURE__*/React.createElement("span", {
+    className: "font-mono"
+  }, didOf(viewerName))), /*#__PURE__*/React.createElement("div", {
+    className: "ml-auto flex gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: runVerify,
+    disabled: verifying,
+    className: "px-4 py-2 text-sm bg-stone-900 text-white rounded-lg hover:bg-stone-700 disabled:opacity-50"
+  }, verifying ? "検証中…" : "整合性を検証"), /*#__PURE__*/React.createElement("button", {
+    onClick: runAnchor,
+    disabled: anchoring,
+    className: "px-4 py-2 text-sm border border-indigo-300 text-indigo-700 rounded-lg hover:bg-indigo-50 disabled:opacity-50"
+  }, anchoring ? "記録中…" : "実チェーンに記録(MetaMask)"))), verifyResult && /*#__PURE__*/React.createElement("div", {
+    className: "rounded-xl border p-4 text-sm " + (verifyResult.ok && verifyResult.dataProblems.length === 0 ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800")
+  }, verifyResult.ok && verifyResult.dataProblems.length === 0 ? /*#__PURE__*/React.createElement("p", null, "✓ 検証OK: 全", verifyResult.length, "ブロックのハッシュ連結・Proof of Workは正常で、", verifyResult.tokenCount, "件のNFTすべてで提出データとチェーン上のハッシュが一致しました(改ざんなし)。") : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("p", {
+    className: "font-semibold"
+  }, "⚠ 問題が検出されました:"), [...verifyResult.problems, ...verifyResult.dataProblems].map((p, i) => /*#__PURE__*/React.createElement("p", {
+    key: i,
+    className: "mt-1"
+  }, "・", p)))), anchorMsg && /*#__PURE__*/React.createElement("div", {
+    className: "bg-indigo-50 border border-indigo-200 rounded-xl p-3 text-sm text-indigo-800 break-all"
+  }, anchorMsg), anchors.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "bg-white border border-stone-200 rounded-xl p-4"
+  }, /*#__PURE__*/React.createElement("h3", {
+    className: "text-sm font-semibold text-stone-700 mb-2"
+  }, "実チェーンへの記録履歴(Ethereum Sepolia)"), anchors.map((a, i) => /*#__PURE__*/React.createElement("p", {
+    key: i,
+    className: "text-xs text-stone-500 font-mono break-all mt-1"
+  }, "ブロック#", a.blockIndex, " → ", /*#__PURE__*/React.createElement("a", {
+    className: "text-indigo-600 underline",
+    href: "https://sepolia.etherscan.io/tx/" + a.txHash,
+    target: "_blank",
+    rel: "noopener noreferrer"
+  }, a.txHash)))), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-2"
+  }, chain.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "bg-white border border-dashed border-stone-300 rounded-xl p-10 text-center text-stone-400 text-sm"
+  }, "まだブロックがありません。学生モードでレポートを提出すると、生成過程NFTの発行とともに最初のブロックが作られます。") : [...chain].reverse().map(b => {
+    const tl = typeLabel(b.data);
+    return /*#__PURE__*/React.createElement("div", {
+      key: b.index,
+      className: "bg-white border border-stone-200 rounded-xl p-3"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center gap-2 flex-wrap"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "font-mono text-sm font-semibold text-stone-800"
+    }, "#", b.index), /*#__PURE__*/React.createElement("span", {
+      className: "text-xs px-2 py-0.5 rounded-full " + tl.cls
+    }, tl.label), /*#__PURE__*/React.createElement("span", {
+      className: "text-xs text-stone-600"
+    }, describeBlock(b.data)), /*#__PURE__*/React.createElement("span", {
+      className: "ml-auto text-xs text-stone-400"
+    }, new Date(b.timestamp).toLocaleString("ja-JP"), " / nonce=", b.nonce)), /*#__PURE__*/React.createElement("p", {
+      className: "text-xs text-stone-400 font-mono break-all mt-1"
+    }, "hash: ", b.hash), /*#__PURE__*/React.createElement("p", {
+      className: "text-xs text-stone-300 font-mono break-all"
+    }, "prev: ", b.prevHash));
+  })), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, "各ブロックはSHA-256で前ブロックのハッシュを含めて計算されているため、過去のブロックを1文字でも書き換えると 以降すべてのハッシュが不一致となり「整合性を検証」で検出されます(nonceは軽量Proof of Workの探索回数)。"));
+}
+
+// ---------- 統計カード ----------
+function StatCards({
+  stats
+}) {
+  const items = [{
+    label: "執筆時間(実働)",
+    value: fmtMs(stats.activeMs),
+    sub: "経過 " + fmtMs(stats.elapsedMs)
+  }, {
+    label: "総文字数",
+    value: stats.totalChars + "字",
+    sub: "手入力 " + stats.typedChars + "字"
+  }, {
+    label: "コピペ率",
+    value: stats.pasteRate + "%",
+    sub: stats.pastes + "回 / " + stats.pasteChars + "字",
+    warn: stats.pasteRate > 40
+  }, {
+    label: "AI由来率",
+    value: stats.aiRate + "%",
+    sub: "依頼 " + stats.aiUses + "回 / " + stats.aiChars + "字",
+    warn: stats.aiRate > 40
+  }, {
+    label: "Web検索",
+    value: stats.searches + "回",
+    sub: "実行回数"
+  }];
+  return /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-2 md:grid-cols-5 gap-3"
+  }, items.map(it => /*#__PURE__*/React.createElement("div", {
+    key: it.label,
+    className: "bg-white rounded-xl border p-3 " + (it.warn ? "border-amber-300" : "border-stone-200")
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, it.label), /*#__PURE__*/React.createElement("p", {
+    className: "text-xl font-semibold font-mono " + (it.warn ? "text-amber-600" : "text-stone-900")
+  }, it.value), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, it.sub))));
+}
+
+// ============================================================
+// 教員ビュー
+// ============================================================
+function TeacherView({
+  refreshSignal
+}) {
+  const [subs, setSubs] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const idx = await loadIndex();
+      const list = [];
+      for (const id of idx) {
+        const s = await loadSubmission(id);
+        if (s) list.push(s);
+      }
+      list.sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""));
+      setSubs(list);
+    } catch (e) {
+      console.error(e);
+    }
+    setLoading(false);
+  }, []);
+  useEffect(() => {
+    reload();
+  }, [reload, refreshSignal]);
+  const toggleShare = async sub => {
+    const updated = {
+      ...sub,
+      shared: !sub.shared
+    };
+    await saveSubmission(updated);
+    // 共有状態の変更をブロックチェーンにも記録(NFTのマーケット公開/非公開)
+    if (updated.nftTokenId) {
+      try {
+        await addBlock({
+          type: "SHARE",
+          tokenId: updated.nftTokenId,
+          shared: updated.shared,
+          by: didOf("teacher")
+        });
+      } catch (e) {
+        console.error("SHAREブロック記録失敗:", e);
+      }
+    }
+    setSubs(prev => prev.map(s => s.id === sub.id ? updated : s));
+    if (selected && selected.id === sub.id) setSelected(updated);
+  };
+  if (selected) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "flex flex-col gap-4"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center gap-3 flex-wrap"
+    }, /*#__PURE__*/React.createElement("button", {
+      onClick: () => setSelected(null),
+      className: "text-sm text-stone-500 hover:text-stone-900"
+    }, "← 一覧へ戻る"), /*#__PURE__*/React.createElement("h2", {
+      className: "text-lg font-semibold text-stone-900"
+    }, selected.title), /*#__PURE__*/React.createElement("span", {
+      className: "text-sm text-stone-400"
+    }, selected.student, " / ", new Date(selected.submittedAt).toLocaleString("ja-JP")), /*#__PURE__*/React.createElement("button", {
+      onClick: () => toggleShare(selected),
+      className: "ml-auto px-4 py-2 text-sm rounded-lg " + (selected.shared ? "bg-emerald-600 text-white" : "border border-stone-300 text-stone-600 hover:bg-stone-50")
+    }, selected.shared ? "学生に共有中(解除する)" : "この生成過程を学生に共有")), /*#__PURE__*/React.createElement(NftCard, {
+      submission: selected
+    }), /*#__PURE__*/React.createElement(StatCards, {
+      stats: selected.stats
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "bg-stone-50 border border-stone-200 rounded-xl p-4"
+    }, /*#__PURE__*/React.createElement("h3", {
+      className: "text-sm font-semibold text-stone-700 mb-3"
+    }, "生成過程の追体験(再生)"), /*#__PURE__*/React.createElement(ProcessPlayer, {
+      submission: selected
+    })));
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center justify-between"
+  }, /*#__PURE__*/React.createElement("h2", {
+    className: "text-lg font-semibold text-stone-900"
+  }, "提出された課題"), /*#__PURE__*/React.createElement("button", {
+    onClick: reload,
+    className: "text-sm text-stone-500 hover:text-stone-900"
+  }, "再読み込み")), loading ? /*#__PURE__*/React.createElement("p", {
+    className: "text-stone-400 text-sm"
+  }, "読み込み中…") : subs.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "bg-white border border-dashed border-stone-300 rounded-xl p-10 text-center text-stone-400 text-sm"
+  }, "まだ提出はありません。学生モードでレポートを作成・提出するか、下の「デモ提出物を生成」を押してください。") : /*#__PURE__*/React.createElement("div", {
+    className: "grid gap-3"
+  }, subs.map(s => /*#__PURE__*/React.createElement("button", {
+    key: s.id,
+    onClick: () => setSelected(s),
+    className: "bg-white border border-stone-200 rounded-xl p-4 text-left hover:border-stone-400 transition-colors"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-3 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "font-semibold text-stone-900"
+  }, s.student), /*#__PURE__*/React.createElement("span", {
+    className: "text-stone-600"
+  }, s.title), s.shared && /*#__PURE__*/React.createElement("span", {
+    className: "text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full"
+  }, "学生に共有中"), /*#__PURE__*/React.createElement("span", {
+    className: "ml-auto text-xs text-stone-400"
+  }, new Date(s.submittedAt).toLocaleString("ja-JP"))), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-4 mt-2 text-xs"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-stone-500"
+  }, s.stats.totalChars, "字 / 実働", fmtMs(s.stats.activeMs)), /*#__PURE__*/React.createElement("span", {
+    className: s.stats.pasteRate > 40 ? "text-amber-600 font-medium" : "text-amber-700"
+  }, "コピペ率 ", s.stats.pasteRate, "%"), /*#__PURE__*/React.createElement("span", {
+    className: "text-violet-700"
+  }, "AI ", s.stats.aiUses, "回"), /*#__PURE__*/React.createElement("span", {
+    className: "text-sky-700"
+  }, "検索 ", s.stats.searches, "回"))))));
+}
+
+// ============================================================
+// 学生: 共有された生成過程の閲覧(NFTマーケットプレイス)
+// 論文の「追体験者がNFTを取得して読書体験を追体験する」流れに対応:
+// 教員が公開した生成過程NFTを学生が取得(ACQUIRE)すると追体験できる。
+// ============================================================
+function SharedProcesses({
+  viewerName
+}) {
+  const [subs, setSubs] = useState([]);
+  const [tokens, setTokens] = useState({});
+  const [selected, setSelected] = useState(null);
+  const [acquiring, setAcquiring] = useState("");
+  const viewerDid = didOf(viewerName);
+  const reload = useCallback(async () => {
+    const idx = await loadIndex();
+    const list = [];
+    for (const id of idx) {
+      const s = await loadSubmission(id);
+      if (s && s.shared) list.push(s);
+    }
+    setSubs(list);
+    setTokens(await chainTokens());
+  }, []);
+  useEffect(() => {
+    reload();
+  }, [reload]);
+  const ownsToken = sub => {
+    if (!sub.nftTokenId) return true; // NFT未発行の旧データはそのまま閲覧可(既存機能を維持)
+    const t = tokens[sub.nftTokenId];
+    if (!t) return true;
+    return t.owners.indexOf(viewerDid) !== -1;
+  };
+  const acquire = async sub => {
+    if (!sub.nftTokenId) return;
+    setAcquiring(sub.id);
+    try {
+      await addBlock({
+        type: "ACQUIRE",
+        tokenId: sub.nftTokenId,
+        owner: viewerDid,
+        ownerName: viewerName
+      });
+      setTokens(await chainTokens());
+      setSelected(sub);
+    } catch (e) {
+      console.error("ACQUIRE失敗:", e);
+    }
+    setAcquiring("");
+  };
+  if (selected) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "flex flex-col gap-4"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center gap-3"
+    }, /*#__PURE__*/React.createElement("button", {
+      onClick: () => setSelected(null),
+      className: "text-sm text-stone-500 hover:text-stone-900"
+    }, "← 一覧へ戻る"), /*#__PURE__*/React.createElement("h2", {
+      className: "text-lg font-semibold text-stone-900"
+    }, selected.title), /*#__PURE__*/React.createElement("span", {
+      className: "text-sm text-stone-400"
+    }, selected.student, " さんの執筆過程")), /*#__PURE__*/React.createElement(NftCard, {
+      submission: selected
+    }), /*#__PURE__*/React.createElement(StatCards, {
+      stats: selected.stats
+    }), /*#__PURE__*/React.createElement(ProcessPlayer, {
+      submission: selected
+    }));
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-3"
+  }, /*#__PURE__*/React.createElement("h2", {
+    className: "text-lg font-semibold text-stone-900"
+  }, "共有された生成過程(NFTマーケット)"), /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-stone-500"
+  }, "教員が公開した生成過程NFTです。「NFTを取得」するとブロックチェーンに取得記録が追加され、追体験できるようになります。"), subs.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "bg-white border border-dashed border-stone-300 rounded-xl p-10 text-center text-stone-400 text-sm"
+  }, "まだ共有された生成過程はありません。") : subs.map(s => {
+    const owned = ownsToken(s);
+    return /*#__PURE__*/React.createElement("div", {
+      key: s.id,
+      className: "bg-white border border-stone-200 rounded-xl p-4 flex items-center gap-3 flex-wrap"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex-1 min-w-48"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "font-semibold text-stone-900"
+    }, s.student), /*#__PURE__*/React.createElement("span", {
+      className: "text-stone-600 ml-2"
+    }, s.title), s.nftTokenId && /*#__PURE__*/React.createElement("span", {
+      className: "ml-2 text-xs font-mono bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full"
+    }, s.nftTokenId), /*#__PURE__*/React.createElement("p", {
+      className: "text-xs text-stone-400 mt-1"
+    }, "実働", fmtMs(s.stats.activeMs), " / コピペ率", s.stats.pasteRate, "% / AI", s.stats.aiUses, "回")), owned ? /*#__PURE__*/React.createElement("button", {
+      onClick: () => setSelected(s),
+      className: "px-4 py-2 text-sm bg-stone-900 text-white rounded-lg hover:bg-stone-700"
+    }, "追体験する") : /*#__PURE__*/React.createElement("button", {
+      onClick: () => acquire(s),
+      disabled: acquiring === s.id,
+      className: "px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-50"
+    }, acquiring === s.id ? "取得中…" : "NFTを取得して追体験"));
+  }));
+}
+
+// ============================================================
+// デモデータ生成
+// ============================================================
+async function seedDemo() {
+  const para1 = "本レポートでは、電子書籍の新たな可能性について論じる。";
+  const search1 = "Web5とは、Jack Dorseyが提唱した分散型インターネットの概念であり、Web2とWeb3を統合したものとされる。";
+  const ai1 = "電子書籍は従来、紙の書籍の携帯性と収納性を高めるものとして普及してきた。しかし高機能なデバイスの普及により、単なる閲覧を超えた新しい読書体験を提供する媒体となる可能性を持っている。";
+  const para2 = "以上を踏まえ、読書体験そのものを共有可能なデータとして扱う仕組みには大きな意義があると考える。";
+  const events = [];
+  let t = 0;
+  let prev = "";
+  const pushText = (type, newText, extra) => {
+    events.push({
+      t,
+      type,
+      d: makeDiff(prev, newText),
+      len: newText.length,
+      ...extra
+    });
+    prev = newText;
+  };
+  events.push({
+    t: 0,
+    type: "start",
+    snapshot: ""
+  });
+  let text = "";
+  for (let i = 3; i <= para1.length; i += 3) {
+    t += 900 + Math.random() * 600;
+    text = para1.slice(0, i);
+    pushText("edit", text, {
+      cursor: text.length
+    });
+  }
+  t += 800;
+  text = para1;
+  pushText("edit", text, {
+    cursor: text.length
+  });
+  t += 4000;
+  events.push({
+    t,
+    type: "search",
+    query: "Web5 とは Jack Dorsey"
+  });
+  t += 6000;
+  events.push({
+    t,
+    type: "searchResult",
+    query: "Web5 とは Jack Dorsey",
+    resultCount: 5
+  });
+  t += 5000;
+  const t2 = text + "\n\n" + search1;
+  pushText("paste", t2, {
+    text: search1,
+    pos: text.length + 2
+  });
+  text = t2;
+  t += 8000;
+  events.push({
+    t,
+    type: "ai",
+    prompt: "電子書籍の歴史的役割を2文でまとめて"
+  });
+  t += 7000;
+  events.push({
+    t,
+    type: "aiResult",
+    prompt: "電子書籍の歴史的役割を2文でまとめて",
+    resultLen: ai1.length
+  });
+  t += 3000;
+  const t3 = text + "\n\n" + ai1;
+  pushText("aiInsert", t3, {
+    text: ai1,
+    pos: text.length + 2
+  });
+  text = t3;
+  const base = text + "\n\n";
+  for (let i = 4; i <= para2.length; i += 4) {
+    t += 1000 + Math.random() * 800;
+    text = base + para2.slice(0, i);
+    pushText("edit", text, {
+      cursor: text.length
+    });
+  }
+  t += 1200;
+  text = base + para2;
+  pushText("edit", text, {
+    cursor: text.length
+  });
+  t += 2000;
+  events.push({
+    t,
+    type: "submit",
+    snapshot: text,
+    len: text.length
+  });
+  const stats = computeStats(events, text);
+  const sub = {
+    id: uid(),
+    student: "山田 太郎(デモ)",
+    title: "電子書籍の新たな可能性について",
+    text,
+    events,
+    stats,
+    submittedAt: new Date().toISOString(),
+    shared: false
+  };
+  await saveSubmission(sub);
+  // デモ提出物にも生成過程NFTを発行
+  try {
+    const contentHash = await submissionContentHash(sub);
+    const tokenId = "RPP-" + uid().toUpperCase();
+    const block = await addBlock({
+      type: "MINT",
+      tokenId,
+      subId: sub.id,
+      owner: didOf(sub.student),
+      ownerName: sub.student,
+      title: sub.title,
+      contentHash
+    });
+    sub.nftTokenId = tokenId;
+    sub.contentHash = contentHash;
+    sub.nftBlockIndex = block.index;
+    await saveSubmission(sub);
+  } catch (e) {
+    console.error(e);
+  }
+  return sub;
+}
+
+// ============================================================
+// アプリ本体
+// ============================================================
+function App() {
+  const [role, setRole] = useState(FIXED_ROLE || "student");
+  const [studentTab, setStudentTab] = useState("write");
+  const [teacherTab, setTeacherTab] = useState("list");
+  const [studentName, setStudentName] = useState("学生A");
+  const [seeding, setSeeding] = useState(false);
+  const [editorKey, setEditorKey] = useState(0);
+  const [refreshSignal, setRefreshSignal] = useState(0);
+  const [settings, setSettings] = useState({
+    geminiKey: "",
+    geminiModel: "gemini-2.5-flash",
+    googleKey: "",
+    googleCx: ""
+  });
+  const [showSettings, setShowSettings] = useState(false);
+  const [notice, setNotice] = useState("");
+  useEffect(() => {
+    (async () => {
+      // 配布時に埋め込まれた共有DB URLを最優先で適用
+      if (typeof window !== "undefined" && window.__SYNC_URL__) setSyncUrl(window.__SYNC_URL__);
+      const s = await dbGet(SETTINGS_KEY);
+      if (s) {
+        setSettings(prev => ({
+          ...prev,
+          ...s
+        }));
+        if (!window.__SYNC_URL__ && s.syncUrl) setSyncUrl(s.syncUrl);
+      }
+    })();
+  }, []);
+  const saveSettings = async s => {
+    setSettings(s);
+    if (!(typeof window !== "undefined" && window.__SYNC_URL__)) setSyncUrl(s.syncUrl || "");
+    await dbSet(SETTINGS_KEY, s);
+    setShowSettings(false);
+    setNotice("API設定を保存しました。");
+  };
+  const handleSubmitted = () => {
+    setEditorKey(k => k + 1);
+    setRefreshSignal(n => n + 1);
+    setNotice("提出が完了しました。教員モードで生成過程を再生できます。");
+  };
+  const runSeed = async () => {
+    setSeeding(true);
+    try {
+      await seedDemo();
+      setRefreshSignal(n => n + 1);
+      setNotice("デモ提出物を生成しました。");
+    } catch (e) {
+      setNotice("デモ生成に失敗: " + e.message);
+    }
+    setSeeding(false);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "min-h-screen bg-stone-50 text-stone-900",
+    style: {
+      fontFamily: "'Hiragino Kaku Gothic ProN','Yu Gothic','Noto Sans JP',sans-serif"
+    }
+  }, /*#__PURE__*/React.createElement("header", {
+    className: "border-b border-stone-200 bg-white"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "max-w-6xl mx-auto px-4 py-3 flex items-center gap-4 flex-wrap"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
+    className: "font-bold text-stone-900 leading-tight"
+  }, "レポート生成過程プラットフォーム", FIXED_ROLE === "student" && /*#__PURE__*/React.createElement("span", {
+    className: "ml-2 text-sm bg-sky-100 text-sky-700 px-2 py-0.5 rounded-full align-middle"
+  }, "学生用"), FIXED_ROLE === "teacher" && /*#__PURE__*/React.createElement("span", {
+    className: "ml-2 text-sm bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full align-middle"
+  }, "教員用")), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400"
+  }, "執筆プロセスの記録と追体験 — Distributed Reading5 応用(ブロックチェーン/NFT搭載)")), /*#__PURE__*/React.createElement("div", {
+    className: "ml-auto flex items-center gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowSettings(true),
+    className: "px-3 py-1.5 text-sm border border-stone-200 rounded-lg text-stone-600 hover:bg-stone-50 flex items-center gap-2"
+  }, "⚙ API設定", /*#__PURE__*/React.createElement("span", {
+    className: "w-2 h-2 rounded-full " + (settings.geminiKey ? "bg-violet-500" : "bg-stone-300"),
+    title: "Gemini"
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "w-2 h-2 rounded-full " + (settings.googleKey && settings.googleCx ? "bg-sky-500" : "bg-stone-300"),
+    title: "Google検索"
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "w-2 h-2 rounded-full " + (syncEnabled() ? "bg-emerald-500" : "bg-stone-300"),
+    title: "共有DB"
+  })), role === "student" && /*#__PURE__*/React.createElement("input", {
+    value: studentName,
+    onChange: e => setStudentName(e.target.value),
+    className: "border border-stone-200 rounded-lg px-3 py-1.5 text-sm w-28 outline-none",
+    placeholder: "氏名"
+  }), !FIXED_ROLE && /*#__PURE__*/React.createElement("div", {
+    className: "flex bg-stone-100 rounded-lg p-1 items-center"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-xs text-stone-400 px-2"
+  }, "開発用切替:"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setRole("student"),
+    className: "px-4 py-1.5 text-sm rounded-md " + (role === "student" ? "bg-white shadow-sm font-medium" : "text-stone-500")
+  }, "学生"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setRole("teacher");
+      setRefreshSignal(n => n + 1);
+    },
+    className: "px-4 py-1.5 text-sm rounded-md " + (role === "teacher" ? "bg-white shadow-sm font-medium" : "text-stone-500")
+  }, "教員"))))), /*#__PURE__*/React.createElement("main", {
+    className: "max-w-6xl mx-auto px-4 py-6 flex flex-col gap-4"
+  }, notice && /*#__PURE__*/React.createElement("div", {
+    className: "bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm rounded-lg px-4 py-2 flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, notice), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setNotice(""),
+    className: "text-emerald-500"
+  }, "×")), role === "student" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 flex-wrap items-center"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setStudentTab("write"),
+    className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "write" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
+  }, "レポート作成"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setStudentTab("shared"),
+    className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "shared" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
+  }, "共有された生成過程(NFT)"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setStudentTab("chain"),
+    className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "chain" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
+  }, "ブロックチェーン"), /*#__PURE__*/React.createElement("span", {
+    className: "ml-auto text-xs text-stone-400 font-mono"
+  }, "DID: ", didOf(studentName))), studentTab === "write" ? /*#__PURE__*/React.createElement(StudentEditor, {
+    key: editorKey,
+    studentName: studentName,
+    settings: settings,
+    onSubmitted: handleSubmitted,
+    onOpenSettings: () => setShowSettings(true)
+  }) : studentTab === "shared" ? /*#__PURE__*/React.createElement(SharedProcesses, {
+    key: refreshSignal,
+    viewerName: studentName
+  }) : /*#__PURE__*/React.createElement(BlockchainView, {
+    key: "c" + refreshSignal,
+    viewerName: studentName
+  })) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTeacherTab("list"),
+    className: "px-4 py-2 text-sm rounded-lg " + (teacherTab === "list" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
+  }, "提出物一覧"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTeacherTab("chain"),
+    className: "px-4 py-2 text-sm rounded-lg " + (teacherTab === "chain" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
+  }, "ブロックチェーン")), teacherTab === "list" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(TeacherView, {
+    refreshSignal: refreshSignal
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "text-center"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: runSeed,
+    disabled: seeding,
+    className: "text-xs text-stone-400 hover:text-stone-600 underline disabled:opacity-50"
+  }, seeding ? "生成中…" : "デモ提出物を生成(動作確認用)"))) : /*#__PURE__*/React.createElement(BlockchainView, {
+    key: "tc" + refreshSignal,
+    viewerName: "teacher"
+  }))), showSettings && /*#__PURE__*/React.createElement(SettingsPanel, {
+    settings: settings,
+    onSave: saveSettings,
+    onClose: () => setShowSettings(false)
+  }));
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));</script>
+</body>
+</html>
