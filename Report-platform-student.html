@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>レポート生成過程プラットフォーム(学生用)</title>
+<title>Knowledge Augmentation and Intelligent Traceability Observatory(学生用)</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -23,7 +23,6 @@ window.storage = {
   async get(key) { const v = localStorage.getItem("rpp:" + key); if (v == null) throw new Error("key not found: " + key); return { key: key, value: v }; },
   async delete(key) { localStorage.removeItem("rpp:" + key); return { key: key, deleted: true }; },
 };
-// 万一のエラー時に白画面ではなく内容を表示(原因調査用)
 window.onerror = function (msg, src, line) {
   var el = document.getElementById("root");
   if (el) el.innerHTML = '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c;">エラーが発生しました:<br>' + msg + ' (line ' + line + ')<br><small>この画面のスクリーンショットを開発者に共有してください。</small></div>';
@@ -508,26 +507,31 @@ async function callGeminiSearch(query, settings) {
         }));
       } catch (e) {}
     }
-    // (2) グラウンディング情報(実際の検索ソース)からURLを補完・追加
+    // (2) グラウンディング(実際のGoogle検索が参照したソース)のURLを最優先で採用。
+    //     モデルが生成したURLはリンク切れのことがあるため、実在が保証される
+    //     グラウンディングURLを優先し、無い場合のみ形式検証済みのモデルURL、
+    //     それも無ければGoogle検索リンクへフォールバックする(遷移エラー対策)。
     const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
-    const sources = chunks.filter(c => c.web).map(c => ({
-      title: c.web.title || c.web.uri,
-      link: c.web.uri,
-      snippet: ""
+    const sources = chunks.filter(c => c.web && c.web.uri).map(c => ({
+      title: c.web.title || "",
+      link: c.web.uri
     }));
-    if (items.length === 0 && sources.length > 0) {
-      items = sources.map(s => ({
-        ...s,
-        snippet: "(Google検索グラウンディングによるソース)"
-      }));
-    } else if (items.length > 0 && sources.length > 0) {
-      // JSON側にURLが無い項目へグラウンディングのURLを補完
-      items = items.map((it, i) => !it.link && sources[i] ? {
-        ...it,
-        link: sources[i].link
-      } : it);
+    const results = [];
+    const n = Math.max(items.length, sources.length);
+    for (let i = 0; i < n && results.length < 6; i++) {
+      const it = items[i] || {};
+      const src = sources[i];
+      const title = it.title || src && src.title || "";
+      let link = src && src.link || (isValidUrl(it.link) ? it.link : "");
+      if (!title && !link) continue;
+      if (!link) link = googleSearchUrl(title);
+      results.push({
+        title: title || link,
+        link,
+        snippet: it.snippet || ""
+      });
     }
-    if (items.length > 0) return items;
+    if (results.length > 0) return results;
     lastErr = new Error("Gemini検索: 結果の解析に失敗しました。もう一度お試しください。");
   }
   throw lastErr || new Error("Gemini検索: 呼び出しに失敗しました");
@@ -561,7 +565,8 @@ async function callBuiltinAI(prompt, context) {
 // モデル名やAPIバージョンの違いによる404は自動で別の組み合わせを試す。
 async function callGemini(prompt, context, settings) {
   if (!settings.geminiKey) throw new Error("NO_KEY");
-  const contentText = "あなたは大学生のレポート執筆を支援するアシスタントです。" + "通常のチャットアシスタントと同じように、丁寧で分かりやすい日本語で、十分な詳しさと具体例を交えて回答してください。" + "必要に応じて構成を整理し、見出しや箇条書きも使って構いません。\n\n" + (context ? "【現在のレポート本文(抜粋)】\n" + context.slice(0, 3000) + "\n\n" : "") + "【依頼】\n" + prompt;
+  // 一般的なGemini利用と同じ挙動: 依頼文をそのまま送信(レポート支援の前提や本文コンテキストは付与しない)
+  const contentText = prompt;
   const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
   const versions = ["v1beta", "v1"];
   let lastErr = null;
@@ -778,17 +783,11 @@ function SettingsPanel({
     className: "font-semibold text-stone-900"
   }, "API設定"), /*#__PURE__*/React.createElement("div", {
     className: "bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-xs text-emerald-800"
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "font-semibold"
-  }, "キーなしでも使えます:"), " 検索・AIとも「内蔵(無料)」を選べば 設定不要で動作します。GeminiやGoogle検索APIを使いたい場合のみ、以下を設定してください。"), /*#__PURE__*/React.createElement("div", {
+  }, "検索・生成AIはいずれも Gemini API(無料枠)を使用します。 下のGemini APIキーを設定してください(キー1つで検索とAIの両方が動作します)。"), /*#__PURE__*/React.createElement("div", {
     className: "bg-sky-50 border border-sky-200 rounded-lg p-3 text-xs text-sky-800"
   }, /*#__PURE__*/React.createElement("span", {
     className: "font-semibold"
-  }, "重要(実行環境について):"), " チャット内のプレビューは セキュリティ制限があり、Gemini / Google APIへは", /*#__PURE__*/React.createElement("span", {
-    className: "font-semibold"
-  }, "キーが正しくても接続できません"), "(プレビューでは「内蔵」を使用)。スタンドアロン版HTMLをブラウザで開けば、", /*#__PURE__*/React.createElement("span", {
-    className: "font-semibold"
-  }, "Geminiキー1つで「Gemini検索」と「Gemini AI」の両方が同時に動作します"), "(Google CSEのキーは不要。逆にスタンドアロン版では「内蔵」は使えません)。"), /*#__PURE__*/React.createElement("div", {
+  }, "実行環境について:"), " チャット内のプレビューでは外部API(Gemini)へ接続できません。 実際の利用は配布用HTML(学生用/教員用)で行ってください。"), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-col gap-1"
   }, /*#__PURE__*/React.createElement("label", {
     className: "text-xs font-medium text-violet-700"
@@ -813,33 +812,6 @@ function SettingsPanel({
   }, "gemini-2.0-flash")), /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-stone-400"
   }, "aistudio.google.com にGoogleアカウントでログイン →「Get API key」→「APIキーを作成」で 無料で取得できます(クレジットカード不要)。")), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col gap-1 border-t border-stone-100 pt-3"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "text-xs font-medium text-sky-700"
-  }, "Google検索 APIキー(Custom Search JSON API / 任意・通常は不要)"), /*#__PURE__*/React.createElement("p", {
-    className: "text-xs text-stone-400"
-  }, "※検索は「内蔵検索」または「Gemini検索」で動くため、この設定は必須ではありません。"), /*#__PURE__*/React.createElement("input", {
-    value: g,
-    onChange: e => setG(e.target.value),
-    type: "password",
-    placeholder: "AIza...",
-    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-400"
-  }), /*#__PURE__*/React.createElement("label", {
-    className: "text-xs font-medium text-sky-700 mt-1"
-  }, "検索エンジンID (cx)"), /*#__PURE__*/React.createElement("input", {
-    value: cx,
-    onChange: e => setCx(e.target.value),
-    placeholder: "0123456789abc...",
-    className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-400"
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "text-xs text-stone-400 leading-relaxed"
-  }, /*#__PURE__*/React.createElement("p", {
-    className: "font-medium text-stone-500"
-  }, "「ウェブ全体を検索」が作成画面で選べない場合:"), /*#__PURE__*/React.createElement("p", null, "① 作成画面の「検索の対象」に仮のサイト(例: example.com)を入力していったん作成 → ② コントロールパネルで作成したエンジンを開き、[概要] 内の「検索の設定」にある 「", /*#__PURE__*/React.createElement("span", {
-    className: "font-medium"
-  }, "ウェブ全体を検索"), "」をオンにする(反映は即時) → ③ 不要なら追加した仮サイトを削除。"), /*#__PURE__*/React.createElement("p", {
-    className: "mt-1 text-amber-700"
-  }, "※Custom Search JSON APIは新規受付を終了していると案内される場合があります。 利用できない場合は「内蔵検索(無料)」をご利用ください。"))), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-col gap-1 border-t border-stone-100 pt-3"
   }, /*#__PURE__*/React.createElement("label", {
     className: "text-xs font-medium text-emerald-700"
@@ -956,9 +928,9 @@ function StudentEditor({
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const [tab, setTab] = useState("search");
-  // スタンドアロン版では外部API(Gemini/Google)が使え、内蔵が使えないため既定を切替
-  const [searchProvider, setSearchProvider] = useState(STANDALONE ? "gemini" : "builtin"); // builtin | gemini | google
-  const [aiProvider, setAiProvider] = useState(STANDALONE ? "gemini" : "builtin"); // builtin | gemini
+  // 検索・生成AIはいずれもGemini API(無料枠)のみを使用
+  const searchProvider = "gemini";
+  const aiProvider = "gemini";
   const [query, setQuery] = useState("");
   const [searchItems, setSearchItems] = useState(null);
   const [searchErr, setSearchErr] = useState("");
@@ -1013,6 +985,65 @@ function StudentEditor({
     }, 1000);
     return () => clearInterval(iv);
   }, []);
+
+  // ---------- 一時保存(下書き) ----------
+  const draftKey = () => "rpp-draft-" + didOf(studentName || "anonymous");
+  const stripEvents = () => eventsRef.current.map(e => {
+    const {
+      _base,
+      _new,
+      ...rest
+    } = e;
+    return rest;
+  });
+
+  // 起動時に下書きがあれば復元(イベントログごと復元し、続きから記録)
+  useEffect(() => {
+    (async () => {
+      try {
+        const d = await dbGet(draftKey());
+        if (d && (d.title || d.text)) {
+          setTitle(d.title || "");
+          setText(d.text || "");
+          eventsRef.current = d.events || [];
+          prevTextRef.current = d.text || "";
+          const lastT = d.events && d.events.length ? d.events[d.events.length - 1].t : 0;
+          startRef.current = Date.now() - lastT;
+          setSubmitStatus({
+            state: "done",
+            msg: "一時保存した下書きを復元しました(" + new Date(d.savedAt).toLocaleString("ja-JP") + " 保存)。続きから執筆できます。"
+          });
+        }
+      } catch (e) {/* 下書きなし */}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const saveDraft = async () => {
+    if (!title.trim() && !text.trim()) {
+      setSubmitStatus({
+        state: "error",
+        msg: "保存する内容がありません。"
+      });
+      return;
+    }
+    try {
+      await dbSet(draftKey(), {
+        title,
+        text,
+        events: stripEvents(),
+        savedAt: new Date().toISOString()
+      });
+      setSubmitStatus({
+        state: "done",
+        msg: "一時保存しました(" + new Date().toLocaleTimeString("ja-JP") + ")。ブラウザを閉じても次回続きから再開できます。"
+      });
+    } catch (e) {
+      setSubmitStatus({
+        state: "error",
+        msg: "一時保存に失敗しました: " + (e.message || e)
+      });
+    }
+  };
   const recordTextChange = (newText, type, extra) => {
     const oldText = prevTextRef.current;
     const d = makeDiff(oldText, newText);
@@ -1063,7 +1094,7 @@ function StudentEditor({
       provider: searchProvider
     });
     try {
-      const items = searchProvider === "google" ? await callGoogleSearch(query, settings) : searchProvider === "gemini" ? await callGeminiSearch(query, settings) : await callBuiltinSearch(query);
+      const items = await callGeminiSearch(query, settings);
       setSearchItems(items);
       pushEvent({
         type: "searchResult",
@@ -1072,12 +1103,9 @@ function StudentEditor({
       });
     } catch (err) {
       if (err.message === "NO_KEY") {
-        setSearchErr(searchProvider === "gemini" ? "Gemini APIキーが未設定です。「API設定」から入力してください(Geminiキー1つで検索とAIの両方が使えます)。" : "Google APIキーと検索エンジンID(cx)が未設定です。「API設定」から入力するか、他の検索に切り替えてください。");
+        setSearchErr("Gemini APIキーが未設定です。「API設定」から入力してください(Geminiキー1つで検索とAIの両方が使えます)。");
       } else if (err.message === "NETWORK_BLOCKED") {
-        setSearchErr("このチャット内プレビューでは、セキュリティ制限により外部サービス(Gemini/Google)への直接接続がブロックされています。キーが正しくても接続できません。ここでは「内蔵検索(無料)」をご利用ください。Gemini検索・Google APIはスタンドアロン版(ダウンロードしたHTMLをブラウザで開く)で動作します。");
-        setSearchProvider("builtin");
-      } else if (err.message === "BUILTIN_UNAVAILABLE") {
-        setSearchErr("内蔵検索はチャット内プレビュー専用のため、この環境では使用できません。「Gemini検索(無料枠)」に切り替えてご利用ください(GeminiキーでOK、Google CSEのキーは不要です)。");
+        setSearchErr("この実行環境からGemini APIへ接続できません(チャット内プレビューでは外部接続が制限されます)。配布用HTML(学生用)でご利用ください。");
       } else {
         setSearchErr("検索エラー: " + err.message);
       }
@@ -1095,7 +1123,7 @@ function StudentEditor({
       provider: aiProvider
     });
     try {
-      const r = aiProvider === "gemini" ? await callGemini(aiPrompt, text, settings) : await callBuiltinAI(aiPrompt, text);
+      const r = await callGemini(aiPrompt, text, settings);
       setAiResult(r || "(空の応答)");
       if (r) aiOutputsRef.current.push(r); // 部分コピペ検出のため回答を記憶
       pushEvent({
@@ -1105,12 +1133,9 @@ function StudentEditor({
       });
     } catch (err) {
       if (err.message === "NO_KEY") {
-        setAiErr("Gemini APIキーが未設定です。「API設定」から入力するか、「内蔵AI(無料)」に切り替えてください。");
+        setAiErr("Gemini APIキーが未設定です。「API設定」から入力してください。");
       } else if (err.message === "NETWORK_BLOCKED") {
-        setAiErr("このチャット内プレビューでは、セキュリティ制限により外部サービス(Gemini API)への直接接続がブロックされています。APIキーが正しくても接続できません。ここでは「内蔵AI(無料)」をご利用ください。Geminiはスタンドアロン版(ダウンロードしたHTMLをブラウザで開く)で動作します。");
-        setAiProvider("builtin");
-      } else if (err.message === "BUILTIN_UNAVAILABLE") {
-        setAiErr("内蔵AIはチャット内プレビュー専用のため、この環境では使用できません。「Gemini(無料枠)」に切り替えてご利用ください。");
+        setAiErr("この実行環境からGemini APIへ接続できません(チャット内プレビューでは外部接続が制限されます)。配布用HTML(学生用)でご利用ください。");
       } else {
         setAiErr("AIエラー: " + err.message);
       }
@@ -1174,6 +1199,9 @@ function StudentEditor({
         shared: false
       };
       const r = await saveSubmission(sub);
+      try {
+        await dbSet(draftKey(), null);
+      } catch (e) {} // 提出済みの下書きを削除
       // --- 生成過程NFTのミント(ブロックチェーンへ記録) ---
       let nftMsg = "";
       try {
@@ -1246,11 +1274,16 @@ function StudentEditor({
     className: "text-violet-700"
   }, "AI由来 ", liveStats.aiChars, "字"), /*#__PURE__*/React.createElement("span", {
     className: "text-sky-700"
-  }, "検索 ", liveStats.searches, "回")), /*#__PURE__*/React.createElement("button", {
+  }, "検索 ", liveStats.searches, "回")), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: saveDraft,
+    className: "px-4 py-2 border border-stone-300 text-stone-600 text-sm font-medium rounded-lg hover:bg-stone-50"
+  }, "一時保存"), /*#__PURE__*/React.createElement("button", {
     onClick: submit,
     disabled: submitStatus.state === "saving",
     className: "px-5 py-2 bg-stone-900 text-white text-sm font-medium rounded-lg hover:bg-stone-700 disabled:opacity-50"
-  }, submitStatus.state === "saving" ? "提出中…" : "レポートを提出"))), /*#__PURE__*/React.createElement("div", {
+  }, submitStatus.state === "saving" ? "提出中…" : "レポートを提出")))), /*#__PURE__*/React.createElement("div", {
     className: "bg-white rounded-xl border border-stone-200 shadow-sm flex flex-col"
   }, /*#__PURE__*/React.createElement("div", {
     className: "flex border-b border-stone-100"
@@ -1263,17 +1296,6 @@ function StudentEditor({
   }, "生成AI")), tab === "search" ? /*#__PURE__*/React.createElement("div", {
     className: "p-4 flex flex-col gap-3 flex-1"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "flex items-center gap-2 text-xs text-stone-400 flex-wrap"
-  }, /*#__PURE__*/React.createElement("span", null, "検索エンジン:"), /*#__PURE__*/React.createElement("button", {
-    className: providerBtn(searchProvider === "builtin"),
-    onClick: () => setSearchProvider("builtin")
-  }, "内蔵検索(無料)"), /*#__PURE__*/React.createElement("button", {
-    className: providerBtn(searchProvider === "gemini"),
-    onClick: () => setSearchProvider("gemini")
-  }, "Gemini検索(無料枠)"), /*#__PURE__*/React.createElement("button", {
-    className: providerBtn(searchProvider === "google"),
-    onClick: () => setSearchProvider("google")
-  }, "Google CSE")), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2"
   }, /*#__PURE__*/React.createElement("input", {
     className: "flex-1 border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-sky-400",
@@ -1289,7 +1311,7 @@ function StudentEditor({
     className: "flex-1 overflow-auto flex flex-col gap-2 min-h-48"
   }, searching && /*#__PURE__*/React.createElement("p", {
     className: "text-sm text-stone-400"
-  }, "検索中…", searchProvider === "builtin" ? "(内蔵検索は数秒かかります)" : ""), searchErr && /*#__PURE__*/React.createElement("div", {
+  }, "検索中…(数秒かかります)"), searchErr && /*#__PURE__*/React.createElement("div", {
     className: "text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3"
   }, searchErr, searchErr.includes("未設定") && /*#__PURE__*/React.createElement("button", {
     onClick: onOpenSettings,
@@ -1304,17 +1326,9 @@ function StudentEditor({
     className: "text-xs text-stone-400"
   }, "※リンクをクリックして開けない場合(埋め込み画面の制限や、AIが返したURLのリンク切れ)は、 「リンクをコピー」してブラウザのアドレスバーに貼り付けるか、「Googleで開く」をご利用ください。"), !searchItems && !searchErr && !searching && /*#__PURE__*/React.createElement("p", {
     className: "text-sm text-stone-400 bg-stone-50 rounded-lg p-3"
-  }, "内蔵検索はキー設定なしで今すぐ使えます。検索の実行はすべてログに記録されます。"))) : /*#__PURE__*/React.createElement("div", {
+  }, "Gemini検索(Google検索グラウンディング)で実際の検索結果を表示します。検索の実行はすべてログに記録されます。"))) : /*#__PURE__*/React.createElement("div", {
     className: "p-4 flex flex-col gap-3 flex-1"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "flex items-center gap-2 text-xs text-stone-400"
-  }, /*#__PURE__*/React.createElement("span", null, "AIモデル:"), /*#__PURE__*/React.createElement("button", {
-    className: providerBtn(aiProvider === "builtin"),
-    onClick: () => setAiProvider("builtin")
-  }, "内蔵AI(無料)"), /*#__PURE__*/React.createElement("button", {
-    className: providerBtn(aiProvider === "gemini"),
-    onClick: () => setAiProvider("gemini")
-  }, "Gemini(無料枠)")), /*#__PURE__*/React.createElement("textarea", {
+  }, /*#__PURE__*/React.createElement("textarea", {
     className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-violet-400 resize-none h-20",
     placeholder: "AIへの依頼(例: 序論の構成案を出して)",
     value: aiPrompt,
@@ -1336,7 +1350,7 @@ function StudentEditor({
     className: "block mt-2 text-violet-700 underline"
   }, "API設定を開く")), /*#__PURE__*/React.createElement("div", {
     className: "flex-1 overflow-auto text-sm text-stone-700 whitespace-pre-wrap bg-stone-50 rounded-lg p-3 min-h-40"
-  }, aiResult || !aiErr && "内蔵AIはキー設定なしで無料で使えます。Gemini無料枠を使う場合はAPI設定でキーを入力してください。利用回数・タイミング・挿入箇所はすべて記録されます。"))));
+  }, aiResult || !aiErr && "Gemini(無料枠)が回答します。利用回数・タイミング・挿入箇所はすべて記録されます。"))));
 }
 
 // ============================================================
@@ -2258,13 +2272,11 @@ function App() {
     className: "max-w-6xl mx-auto px-4 py-3 flex items-center gap-4 flex-wrap"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
     className: "font-bold text-stone-900 leading-tight"
-  }, "レポート生成過程プラットフォーム", FIXED_ROLE === "student" && /*#__PURE__*/React.createElement("span", {
+  }, "Knowledge Augmentation and Intelligent Traceability Observatory", FIXED_ROLE === "student" && /*#__PURE__*/React.createElement("span", {
     className: "ml-2 text-sm bg-sky-100 text-sky-700 px-2 py-0.5 rounded-full align-middle"
   }, "学生用"), FIXED_ROLE === "teacher" && /*#__PURE__*/React.createElement("span", {
     className: "ml-2 text-sm bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full align-middle"
-  }, "教員用")), /*#__PURE__*/React.createElement("p", {
-    className: "text-xs text-stone-400"
-  }, "執筆プロセスの記録と追体験 — Distributed Reading5 応用(ブロックチェーン/NFT搭載)")), /*#__PURE__*/React.createElement("div", {
+  }, "教員用"))), /*#__PURE__*/React.createElement("div", {
     className: "ml-auto flex items-center gap-2 flex-wrap"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowSettings(true),
@@ -2272,9 +2284,6 @@ function App() {
   }, "⚙ API設定", /*#__PURE__*/React.createElement("span", {
     className: "w-2 h-2 rounded-full " + (settings.geminiKey ? "bg-violet-500" : "bg-stone-300"),
     title: "Gemini"
-  }), /*#__PURE__*/React.createElement("span", {
-    className: "w-2 h-2 rounded-full " + (settings.googleKey && settings.googleCx ? "bg-sky-500" : "bg-stone-300"),
-    title: "Google検索"
   }), /*#__PURE__*/React.createElement("span", {
     className: "w-2 h-2 rounded-full " + (syncEnabled() ? "bg-emerald-500" : "bg-stone-300"),
     title: "共有DB"
