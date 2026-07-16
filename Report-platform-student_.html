@@ -8,13 +8,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script>
-// ============================================================
-// 【管理者向け 配布前設定】
-// 複数人(学生・教員が別々のPC/スマホ)で運用する場合は、下の __SYNC_URL__ に
-// Firebase Realtime Database のURLを記入してからホスティングしてください。
-// 例: window.__SYNC_URL__ = "https://myclass-default-rtdb.firebaseio.com";
-// 空のままの場合、データは各自のブラウザ内にのみ保存されます。
-// ============================================================
 window.__SYNC_URL__ = "https://writing5-default-rtdb.firebaseio.com/";
 window.__ROLE__ = "student";
 window.__STANDALONE__ = true;
@@ -378,6 +371,128 @@ async function submissionContentHash(sub) {
 }
 
 // ---------- ユーティリティ ----------
+// --- 検索: Gemini検索(Google検索グラウンディング / 無料枠) ---
+async function callGeminiSearch(query, settings) {
+  if (!settings.geminiKey) throw new Error("NO_KEY");
+  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
+  let lastErr = null;
+  for (const model of models) {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: "「" + query + "」についてGoogle検索を実行し、検索結果の上位5件をJSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "実際のページのURL", "snippet": "内容の要約(日本語で2〜3文)"} の形式。' + "linkは必ず http または https で始まる実在のURLにすること。JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。"
+            }]
+          }],
+          tools: [{
+            google_search: {}
+          }]
+        })
+      });
+    } catch (e) {
+      throw new Error("NETWORK_BLOCKED");
+    }
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (e) {}
+    if (data.error) {
+      lastErr = new Error("Gemini検索: " + (data.error.message || res.status));
+      if (data.error.code === 404 || res.status === 404) continue;
+      throw lastErr;
+    }
+    const cand = data.candidates && data.candidates[0];
+    const parts = cand && cand.content && cand.content.parts;
+    const text = (parts || []).map(p => p.text || "").join("");
+    let items = [];
+    const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
+    if (m) {
+      try {
+        items = JSON.parse(m[0]);
+      } catch (e) {}
+    }
+    const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
+    const sources = chunks.filter(c => c.web && c.web.uri).map(c => ({
+      title: c.web.title || "",
+      link: c.web.uri
+    }));
+    const results = [];
+    const n = Math.max(items.length, sources.length);
+    for (let i = 0; i < n && results.length < 6; i++) {
+      const it = items[i] || {};
+      const src = sources[i];
+      const title = it.title || src && src.title || "";
+      let link = src && src.link || (isValidUrl(it.link) ? it.link : "");
+      if (!title && !link) continue;
+      if (!link) link = googleSearchUrl(title);
+      results.push({
+        title: title || link,
+        link,
+        snippet: it.snippet || ""
+      });
+    }
+    if (results.length > 0) return results;
+    lastErr = new Error("Gemini検索: 結果の解析に失敗しました。もう一度お試しください。");
+  }
+  throw lastErr || new Error("Gemini検索: 呼び出しに失敗しました");
+}
+
+// --- 生成AI: Gemini API(無料枠) ---
+async function callGemini(prompt, context, settings) {
+  if (!settings.geminiKey) throw new Error("NO_KEY");
+  const contentText = prompt; // 一般的なGemini利用と同じ挙動(前提文・本文コンテキストは付与しない)
+  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
+  const versions = ["v1beta", "v1"];
+  let lastErr = null;
+  for (const model of models) {
+    for (const ver of versions) {
+      const url = "https://generativelanguage.googleapis.com/" + ver + "/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
+      let res;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{
+                text: contentText
+              }]
+            }],
+            generationConfig: {
+              maxOutputTokens: 4096,
+              temperature: 0.7
+            }
+          })
+        });
+      } catch (e) {
+        throw new Error("NETWORK_BLOCKED");
+      }
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (e) {}
+      if (data.error) {
+        lastErr = new Error("Gemini API: " + (data.error.message || res.status));
+        if (data.error.code === 404 || res.status === 404) continue;
+        throw lastErr;
+      }
+      const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+      const out = (parts || []).map(p => p.text || "").join("");
+      if (out) return out;
+      lastErr = new Error("Gemini API: 応答が空でした");
+    }
+  }
+  throw lastErr || new Error("Gemini API: 呼び出しに失敗しました");
+}
 function fmtMs(ms) {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
@@ -816,28 +931,39 @@ function StudentEditor({
     } = e;
     return rest;
   });
+  const [draftAvailable, setDraftAvailable] = useState(null); // {title, savedAt} | null
 
-  // 起動時に下書きがあれば復元(イベントログごと復元し、続きから記録)
+  // 起動時: 下書きの有無だけ確認し、内容は「再開」ボタンが押されるまで反映しない
   useEffect(() => {
     (async () => {
       try {
         const d = await dbGetLocal(draftKey());
-        if (d && (d.title || d.text)) {
-          setTitle(d.title || "");
-          setText(d.text || "");
-          eventsRef.current = d.events || [];
-          prevTextRef.current = d.text || "";
-          const lastT = d.events && d.events.length ? d.events[d.events.length - 1].t : 0;
-          startRef.current = Date.now() - lastT;
-          setSubmitStatus({
-            state: "done",
-            msg: "一時保存した下書きを復元しました(" + new Date(d.savedAt).toLocaleString("ja-JP") + " 保存)。続きから執筆できます。"
-          });
-        }
+        if (d && (d.title || d.text)) setDraftAvailable(d);
       } catch (e) {/* 下書きなし */}
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const resumeDraft = () => {
+    const d = draftAvailable;
+    if (!d) return;
+    setTitle(d.title || "");
+    setText(d.text || "");
+    eventsRef.current = d.events || [];
+    prevTextRef.current = d.text || "";
+    const lastT = d.events && d.events.length ? d.events[d.events.length - 1].t : 0;
+    startRef.current = Date.now() - lastT;
+    setDraftAvailable(null);
+    setSubmitStatus({
+      state: "done",
+      msg: "一時保存した下書き(" + new Date(d.savedAt).toLocaleString("ja-JP") + " 保存)から再開しました。続きから執筆できます。"
+    });
+  };
+  const discardDraft = async () => {
+    try {
+      await dbSetLocal(draftKey(), null);
+    } catch (e) {}
+    setDraftAvailable(null);
+  };
   const saveDraft = async () => {
     if (!title.trim() && !text.trim()) {
       setSubmitStatus({
@@ -855,7 +981,7 @@ function StudentEditor({
       });
       setSubmitStatus({
         state: "done",
-        msg: "一時保存しました(" + new Date().toLocaleTimeString("ja-JP") + ")。この端末のブラウザ内にあなた専用で保存され、他の学生には表示されません。次回開くと自動で再開されます。"
+        msg: "一時保存しました(" + new Date().toLocaleTimeString("ja-JP") + ")。この端末のブラウザ内にあなた専用で保存され、他の学生には表示されません。"
       });
     } catch (e) {
       setSubmitStatus({
@@ -1022,6 +1148,7 @@ function StudentEditor({
       try {
         await dbSetLocal(draftKey(), null);
       } catch (e) {} // 提出済みの下書きを削除
+      setDraftAvailable(null);
       // --- 生成過程NFTのミント(ブロックチェーンへ記録) ---
       let nftMsg = "";
       try {
@@ -1061,6 +1188,20 @@ function StudentEditor({
   const liveStats = computeStats(eventsRef.current, text);
   const providerBtn = active => "px-2 py-1 text-xs rounded " + (active ? "bg-stone-800 text-white" : "bg-stone-100 text-stone-500 hover:bg-stone-200");
   return /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-4"
+  }, draftAvailable && /*#__PURE__*/React.createElement("div", {
+    className: "bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex items-center gap-3 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-sm text-amber-800"
+  }, "一時保存された下書き「", draftAvailable.title || "(無題)", "」があります(", new Date(draftAvailable.savedAt).toLocaleString("ja-JP"), " 保存)。"), /*#__PURE__*/React.createElement("div", {
+    className: "ml-auto flex gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: resumeDraft,
+    className: "px-4 py-1.5 text-sm bg-amber-600 text-white rounded-lg hover:bg-amber-500"
+  }, "再開する"), /*#__PURE__*/React.createElement("button", {
+    onClick: discardDraft,
+    className: "px-4 py-1.5 text-sm border border-amber-300 text-amber-700 rounded-lg hover:bg-amber-100"
+  }, "破棄して新規作成"))), /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-1 lg:grid-cols-3 gap-4"
   }, /*#__PURE__*/React.createElement("div", {
     className: "lg:col-span-2 bg-white rounded-xl border border-stone-200 shadow-sm flex flex-col"
@@ -1172,7 +1313,7 @@ function StudentEditor({
     className: "block mt-2 text-violet-700 underline"
   }, "API設定を開く")), /*#__PURE__*/React.createElement("div", {
     className: "flex-1 overflow-auto text-sm text-stone-700 whitespace-pre-wrap bg-stone-50 rounded-lg p-3 min-h-40"
-  }, aiResult || !aiErr && "Gemini(無料枠)が回答します。利用回数・タイミング・挿入箇所はすべて記録されます。"))));
+  }, aiResult || !aiErr && "Gemini(無料枠)が回答します。利用回数・タイミング・挿入箇所はすべて記録されます。")))));
 }
 
 // ============================================================
