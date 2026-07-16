@@ -150,6 +150,26 @@ async function dbGet(key) {
   if (memStore[key] != null) return JSON.parse(memStore[key]);
   return null;
 }
+
+// 端末ローカル専用の保存(下書き用)。共有DBには送らないため、
+// 一時保存は「この端末のこのブラウザ + 学生氏名」ごとに完全に分離される。
+async function dbSetLocal(key, value) {
+  const json = JSON.stringify(value);
+  memStore[key] = json;
+  try {
+    if (window.storage) await window.storage.set(key, json, false);
+  } catch (e) {}
+}
+async function dbGetLocal(key) {
+  try {
+    if (window.storage) {
+      const r = await window.storage.get(key, false);
+      if (r && r.value != null) return JSON.parse(r.value);
+    }
+  } catch (e) {}
+  if (memStore[key] != null) return JSON.parse(memStore[key]);
+  return null;
+}
 const INDEX_KEY = "rpp-index";
 const SETTINGS_KEY = "rpp-settings";
 async function loadIndex() {
@@ -255,7 +275,6 @@ function didOf(name) {
   return "did:rpp:" + h.toString(16).padStart(8, "0");
 }
 const CHAIN_KEY = "rpp-chain";
-const ANCHOR_KEY = "rpp-anchors";
 async function loadChain() {
   return (await dbGet(CHAIN_KEY)) || [];
 }
@@ -358,264 +377,6 @@ async function submissionContentHash(sub) {
   }));
 }
 
-// --- 実チェーンアンカリング(MetaMask / Ethereum Sepoliaテストネット) ---
-async function anchorToEthereum(hashHex) {
-  if (typeof window === "undefined" || !window.ethereum) throw new Error("NO_WALLET");
-  const accounts = await window.ethereum.request({
-    method: "eth_requestAccounts"
-  });
-  const from = accounts[0];
-  // 自分宛て0値トランザクションのdataにハッシュを埋め込む(存在証明 / Proof of Existence)
-  const txHash = await window.ethereum.request({
-    method: "eth_sendTransaction",
-    params: [{
-      from,
-      to: from,
-      value: "0x0",
-      data: "0x" + hashHex
-    }]
-  });
-  return {
-    txHash,
-    from
-  };
-}
-async function loadAnchors() {
-  return (await dbGet(ANCHOR_KEY)) || [];
-}
-async function saveAnchor(anchor) {
-  const list = await loadAnchors();
-  list.unshift(anchor);
-  await dbSet(ANCHOR_KEY, list);
-}
-
-// ============================================================
-// 外部API
-// ============================================================
-
-// --- 検索(1): 内蔵検索 -- 無料・キー不要 ---
-// このアーティファクト環境に組み込まれたAI(Anthropic API)のWeb検索ツールを利用。
-async function callBuiltinSearch(query) {
-  let res;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1500,
-        messages: [{
-          role: "user",
-          content: "次のクエリでWeb検索を実行し、上位5件の結果をJSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "URL", "snippet": "内容の短い要約(日本語)"} の形式。' + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。\nクエリ: " + query
-        }],
-        tools: [{
-          type: "web_search_20250305",
-          name: "web_search"
-        }]
-      })
-    });
-  } catch (e) {
-    throw new Error("BUILTIN_UNAVAILABLE");
-  }
-  const data = await res.json();
-  if (data.error) throw new Error(STANDALONE ? "BUILTIN_UNAVAILABLE" : "内蔵検索: " + (data.error.message || "エラー"));
-  const text = (data.content || []).map(b => b.type === "text" ? b.text : "").join("\n");
-  const clean = text.replace(/```json|```/g, "").trim();
-  const m = clean.match(/\[[\s\S]*\]/);
-  if (!m) throw new Error("検索結果の解析に失敗しました。もう一度お試しください。");
-  const arr = JSON.parse(m[0]);
-  return arr.map(it => ({
-    title: it.title || "",
-    link: it.link || it.url || "",
-    snippet: it.snippet || ""
-  }));
-}
-
-// --- 検索(2): Google Custom Search JSON API (キー必要) ---
-async function callGoogleSearch(query, settings) {
-  if (!settings.googleKey || !settings.googleCx) throw new Error("NO_KEY");
-  const url = "https://www.googleapis.com/customsearch/v1?key=" + encodeURIComponent(settings.googleKey) + "&cx=" + encodeURIComponent(settings.googleCx) + "&q=" + encodeURIComponent(query) + "&num=6";
-  let res;
-  try {
-    res = await fetch(url);
-  } catch (e) {
-    throw new Error("NETWORK_BLOCKED");
-  }
-  const data = await res.json();
-  if (data.error) throw new Error("Google API: " + data.error.message);
-  return (data.items || []).map(it => ({
-    title: it.title,
-    link: it.link,
-    snippet: it.snippet || ""
-  }));
-}
-
-// --- 検索(3): Gemini検索 -- GeminiのGoogle検索グラウンディング(無料枠・Geminiキーで利用可) ---
-// Gemini API の google_search ツールを使い、実際のGoogle検索に基づく結果を取得する。
-// これによりGeminiキー1つで「検索」と「AI」の両方が同一アプリ内で動作する。
-async function callGeminiSearch(query, settings) {
-  if (!settings.geminiKey) throw new Error("NO_KEY");
-  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
-  let lastErr = null;
-  for (const model of models) {
-    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
-    let res;
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [{
-              text: "「" + query + "」についてGoogle検索を実行し、検索結果の上位5件をJSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "実際のページのURL", "snippet": "内容の要約(日本語で2〜3文)"} の形式。' + "linkは必ず http または https で始まる実在のURLにすること。" + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。"
-            }]
-          }],
-          tools: [{
-            google_search: {}
-          }]
-        })
-      });
-    } catch (e) {
-      throw new Error("NETWORK_BLOCKED");
-    }
-    let data = {};
-    try {
-      data = await res.json();
-    } catch (e) {}
-    if (data.error) {
-      lastErr = new Error("Gemini検索: " + (data.error.message || res.status));
-      if (data.error.code === 404 || res.status === 404) continue; // モデル違いは次を試す
-      throw lastErr;
-    }
-    const cand = data.candidates && data.candidates[0];
-    const parts = cand && cand.content && cand.content.parts;
-    const text = (parts || []).map(p => p.text || "").join("");
-
-    // (1) モデルが返したJSONを解析
-    let items = [];
-    const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
-    if (m) {
-      try {
-        items = JSON.parse(m[0]).map(it => ({
-          title: it.title || "",
-          link: it.link || it.url || "",
-          snippet: it.snippet || ""
-        }));
-      } catch (e) {}
-    }
-    // (2) グラウンディング(実際のGoogle検索が参照したソース)のURLを最優先で採用。
-    //     モデルが生成したURLはリンク切れのことがあるため、実在が保証される
-    //     グラウンディングURLを優先し、無い場合のみ形式検証済みのモデルURL、
-    //     それも無ければGoogle検索リンクへフォールバックする(遷移エラー対策)。
-    const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
-    const sources = chunks.filter(c => c.web && c.web.uri).map(c => ({
-      title: c.web.title || "",
-      link: c.web.uri
-    }));
-    const results = [];
-    const n = Math.max(items.length, sources.length);
-    for (let i = 0; i < n && results.length < 6; i++) {
-      const it = items[i] || {};
-      const src = sources[i];
-      const title = it.title || src && src.title || "";
-      let link = src && src.link || (isValidUrl(it.link) ? it.link : "");
-      if (!title && !link) continue;
-      if (!link) link = googleSearchUrl(title);
-      results.push({
-        title: title || link,
-        link,
-        snippet: it.snippet || ""
-      });
-    }
-    if (results.length > 0) return results;
-    lastErr = new Error("Gemini検索: 結果の解析に失敗しました。もう一度お試しください。");
-  }
-  throw lastErr || new Error("Gemini検索: 呼び出しに失敗しました");
-}
-async function callBuiltinAI(prompt, context) {
-  let res;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 2048,
-        messages: [{
-          role: "user",
-          content: "あなたは大学生のレポート執筆を支援するアシスタントです。" + "通常のチャットアシスタントと同じように、丁寧で分かりやすい日本語で、十分な詳しさで回答してください。\n\n" + (context ? "【現在のレポート本文(抜粋)】\n" + context.slice(0, 3000) + "\n\n" : "") + "【依頼】\n" + prompt
-        }]
-      })
-    });
-  } catch (e) {
-    throw new Error("BUILTIN_UNAVAILABLE");
-  }
-  const data = await res.json();
-  if (data.error) throw new Error(STANDALONE ? "BUILTIN_UNAVAILABLE" : "内蔵AI: " + (data.error.message || "エラー"));
-  return (data.content || []).map(b => b.type === "text" ? b.text : "").filter(Boolean).join("\n");
-}
-
-// --- AI(2): Gemini API 無料枠 (Google AI Studioのキー必要) ---
-// モデル名やAPIバージョンの違いによる404は自動で別の組み合わせを試す。
-async function callGemini(prompt, context, settings) {
-  if (!settings.geminiKey) throw new Error("NO_KEY");
-  // 一般的なGemini利用と同じ挙動: 依頼文をそのまま送信(レポート支援の前提や本文コンテキストは付与しない)
-  const contentText = prompt;
-  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
-  const versions = ["v1beta", "v1"];
-  let lastErr = null;
-  for (const model of models) {
-    for (const ver of versions) {
-      const url = "https://generativelanguage.googleapis.com/" + ver + "/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
-      let res;
-      try {
-        res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            contents: [{
-              parts: [{
-                text: contentText
-              }]
-            }],
-            generationConfig: {
-              maxOutputTokens: 4096,
-              temperature: 0.7
-            }
-          })
-        });
-      } catch (e) {
-        // fetch自体の失敗 = この実行環境から外部ドメインへの通信がブロックされている
-        throw new Error("NETWORK_BLOCKED");
-      }
-      let data = {};
-      try {
-        data = await res.json();
-      } catch (e) {}
-      if (data.error) {
-        lastErr = new Error("Gemini API: " + (data.error.message || res.status));
-        // 404はモデル名/バージョン違いの可能性 → 次の組み合わせを試す
-        if (data.error.code === 404 || res.status === 404) continue;
-        // 401/403(キー無効)、429(無料枠上限)などは即時報告
-        throw lastErr;
-      }
-      const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-      const out = (parts || []).map(p => p.text || "").join("");
-      if (out) return out;
-      lastErr = new Error("Gemini API: 応答が空でした");
-    }
-  }
-  throw lastErr || new Error("Gemini API: 呼び出しに失敗しました");
-}
-
 // ---------- ユーティリティ ----------
 function fmtMs(ms) {
   const s = Math.floor(ms / 1000);
@@ -675,6 +436,18 @@ const EVENT_META = {
     color: "bg-stone-800",
     text: "text-stone-800",
     ring: "ring-stone-300"
+  },
+  blur: {
+    label: "離脱",
+    color: "bg-rose-400",
+    text: "text-rose-600",
+    ring: "ring-rose-200"
+  },
+  focus: {
+    label: "復帰",
+    color: "bg-stone-400",
+    text: "text-stone-600",
+    ring: "ring-stone-200"
   }
 };
 
@@ -712,8 +485,11 @@ function computeStats(events, finalText) {
     pastes = 0;
   let legacyPasted = 0,
     legacyAi = 0;
-  let activeMs = 0;
-  let prevT = null;
+  let activeMs = 0,
+    awayMs = 0,
+    awayCount = 0;
+  let prevT = null,
+    prevType = null;
   events.forEach(e => {
     if (e.type === "paste") {
       pastes++;
@@ -722,11 +498,17 @@ function computeStats(events, finalText) {
     if (e.type === "aiInsert") legacyAi += (e.text || "").length;
     if (e.type === "search") searches++;
     if (e.type === "ai") aiUses++;
-    if (prevT != null) {
+    if (e.type === "focus") {
+      awayCount++;
+      awayMs += e.awayMs || 0;
+    }
+    if (prevT != null && prevType !== "blur") {
+      // 離脱中の時間は実働に含めない
       const gap = e.t - prevT;
       if (gap < 30000) activeMs += gap;
     }
     prevT = e.t;
+    prevType = e.type;
   });
   const elapsed = events.length ? events[events.length - 1].t - events[0].t : 0;
 
@@ -755,7 +537,9 @@ function computeStats(events, finalText) {
     aiUses,
     pastes,
     elapsedMs: elapsed,
-    activeMs
+    activeMs,
+    awayMs,
+    awayCount
   };
 }
 
@@ -950,6 +734,7 @@ function StudentEditor({
   const taRef = useRef(null);
   const pasteInfoRef = useRef(null);
   const aiOutputsRef = useRef([]); // このセッションでAIが出力した回答(部分コピペ検出用)
+  const hiddenRef = useRef(null); // 画面離脱(別タブ/他アプリ)の開始時刻
 
   // 貼り付けられたテキストがAIの回答(の一部)かを判定
   const isFromAI = pasted => {
@@ -986,6 +771,41 @@ function StudentEditor({
     return () => clearInterval(iv);
   }, []);
 
+  // ---------- 別タブ・他アプリ利用の検知(Page Visibility API) ----------
+  // 本システムのタブが非表示になった/ウィンドウがフォーカスを失った時刻を記録し、
+  // 復帰時に離脱時間(別タブ・他アプリの利用時間)としてイベントログに残す。
+  useEffect(() => {
+    const onHide = () => {
+      if (startRef.current && hiddenRef.current == null) {
+        hiddenRef.current = Date.now();
+        pushEvent({
+          type: "blur"
+        });
+      }
+    };
+    const onShow = () => {
+      if (hiddenRef.current != null) {
+        const away = Date.now() - hiddenRef.current;
+        hiddenRef.current = null;
+        pushEvent({
+          type: "focus",
+          awayMs: away
+        });
+      }
+    };
+    const onVis = () => {
+      if (document.hidden) onHide();else onShow();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("blur", onHide);
+    window.addEventListener("focus", onShow);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("blur", onHide);
+      window.removeEventListener("focus", onShow);
+    };
+  }, [pushEvent]);
+
   // ---------- 一時保存(下書き) ----------
   const draftKey = () => "rpp-draft-" + didOf(studentName || "anonymous");
   const stripEvents = () => eventsRef.current.map(e => {
@@ -1001,7 +821,7 @@ function StudentEditor({
   useEffect(() => {
     (async () => {
       try {
-        const d = await dbGet(draftKey());
+        const d = await dbGetLocal(draftKey());
         if (d && (d.title || d.text)) {
           setTitle(d.title || "");
           setText(d.text || "");
@@ -1027,7 +847,7 @@ function StudentEditor({
       return;
     }
     try {
-      await dbSet(draftKey(), {
+      await dbSetLocal(draftKey(), {
         title,
         text,
         events: stripEvents(),
@@ -1035,7 +855,7 @@ function StudentEditor({
       });
       setSubmitStatus({
         state: "done",
-        msg: "一時保存しました(" + new Date().toLocaleTimeString("ja-JP") + ")。ブラウザを閉じても次回続きから再開できます。"
+        msg: "一時保存しました(" + new Date().toLocaleTimeString("ja-JP") + ")。この端末のブラウザ内にあなた専用で保存され、他の学生には表示されません。次回開くと自動で再開されます。"
       });
     } catch (e) {
       setSubmitStatus({
@@ -1200,7 +1020,7 @@ function StudentEditor({
       };
       const r = await saveSubmission(sub);
       try {
-        await dbSet(draftKey(), null);
+        await dbSetLocal(draftKey(), null);
       } catch (e) {} // 提出済みの下書きを削除
       // --- 生成過程NFTのミント(ブロックチェーンへ記録) ---
       let nftMsg = "";
@@ -1274,7 +1094,9 @@ function StudentEditor({
     className: "text-violet-700"
   }, "AI由来 ", liveStats.aiChars, "字"), /*#__PURE__*/React.createElement("span", {
     className: "text-sky-700"
-  }, "検索 ", liveStats.searches, "回")), /*#__PURE__*/React.createElement("div", {
+  }, "検索 ", liveStats.searches, "回"), /*#__PURE__*/React.createElement("span", {
+    className: "text-rose-500"
+  }, "離脱 ", liveStats.awayCount || 0, "回")), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: saveDraft,
@@ -1471,6 +1293,10 @@ function ProcessPlayer({
         return "AIの回答を閲覧";
       case "aiInsert":
         return "AIの回答(" + (e.text || "").length + "字)を位置" + e.pos + "に挿入";
+      case "blur":
+        return "別タブ/他アプリへ移動(本システムが画面から非表示になった)";
+      case "focus":
+        return "本システムへ復帰(離脱時間 " + fmtMs(e.awayMs || 0) + " ── 別タブでの検索・AI利用等の可能性)";
       case "submit":
         return "レポート提出";
       default:
@@ -1634,12 +1460,8 @@ function BlockchainView({
   const [chain, setChain] = useState([]);
   const [verifyResult, setVerifyResult] = useState(null);
   const [verifying, setVerifying] = useState(false);
-  const [anchors, setAnchors] = useState([]);
-  const [anchorMsg, setAnchorMsg] = useState("");
-  const [anchoring, setAnchoring] = useState(false);
   const reload = useCallback(async () => {
     setChain(await loadChain());
-    setAnchors(await loadAnchors());
   }, []);
   useEffect(() => {
     reload();
@@ -1668,38 +1490,6 @@ function BlockchainView({
       tokenCount: Object.keys(tokens).length
     });
     setVerifying(false);
-  };
-  const runAnchor = async () => {
-    if (chain.length === 0) {
-      setAnchorMsg("チェーンが空です。先にレポートを提出してNFTを発行してください。");
-      return;
-    }
-    setAnchoring(true);
-    setAnchorMsg("");
-    try {
-      const latest = chain[chain.length - 1];
-      const {
-        txHash,
-        from
-      } = await anchorToEthereum(latest.hash);
-      const anchor = {
-        blockIndex: latest.index,
-        blockHash: latest.hash,
-        txHash,
-        from,
-        at: new Date().toISOString()
-      };
-      await saveAnchor(anchor);
-      setAnchors(await loadAnchors());
-      setAnchorMsg("ブロック#" + latest.index + " のハッシュをEthereum(Sepolia)に記録しました。Tx: " + txHash);
-    } catch (e) {
-      if (e.message === "NO_WALLET") {
-        setAnchorMsg(STANDALONE ? "MetaMask等のウォレット拡張機能が見つかりません。ブラウザにMetaMaskをインストールし、Sepoliaテストネットを選択してから再実行してください(テスト用ETHはfaucetで無料入手できます)。" : "実チェーンへの記録はスタンドアロン版でのみ利用できます(このプレビュー環境ではウォレットに接続できません)。ローカルチェーンとNFTはこの環境でも動作しています。");
-      } else {
-        setAnchorMsg("記録に失敗しました: " + (e.message || e));
-      }
-    }
-    setAnchoring(false);
   };
   const typeLabel = d => {
     switch ((d || {}).type) {
@@ -1754,32 +1544,14 @@ function BlockchainView({
     onClick: runVerify,
     disabled: verifying,
     className: "px-4 py-2 text-sm bg-stone-900 text-white rounded-lg hover:bg-stone-700 disabled:opacity-50"
-  }, verifying ? "検証中…" : "整合性を検証"), /*#__PURE__*/React.createElement("button", {
-    onClick: runAnchor,
-    disabled: anchoring,
-    className: "px-4 py-2 text-sm border border-indigo-300 text-indigo-700 rounded-lg hover:bg-indigo-50 disabled:opacity-50"
-  }, anchoring ? "記録中…" : "実チェーンに記録(MetaMask)"))), verifyResult && /*#__PURE__*/React.createElement("div", {
+  }, verifying ? "検証中…" : "整合性を検証"))), verifyResult && /*#__PURE__*/React.createElement("div", {
     className: "rounded-xl border p-4 text-sm " + (verifyResult.ok && verifyResult.dataProblems.length === 0 ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800")
   }, verifyResult.ok && verifyResult.dataProblems.length === 0 ? /*#__PURE__*/React.createElement("p", null, "✓ 検証OK: 全", verifyResult.length, "ブロックのハッシュ連結・Proof of Workは正常で、", verifyResult.tokenCount, "件のNFTすべてで提出データとチェーン上のハッシュが一致しました(改ざんなし)。") : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("p", {
     className: "font-semibold"
   }, "⚠ 問題が検出されました:"), [...verifyResult.problems, ...verifyResult.dataProblems].map((p, i) => /*#__PURE__*/React.createElement("p", {
     key: i,
     className: "mt-1"
-  }, "・", p)))), anchorMsg && /*#__PURE__*/React.createElement("div", {
-    className: "bg-indigo-50 border border-indigo-200 rounded-xl p-3 text-sm text-indigo-800 break-all"
-  }, anchorMsg), anchors.length > 0 && /*#__PURE__*/React.createElement("div", {
-    className: "bg-white border border-stone-200 rounded-xl p-4"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "text-sm font-semibold text-stone-700 mb-2"
-  }, "実チェーンへの記録履歴(Ethereum Sepolia)"), anchors.map((a, i) => /*#__PURE__*/React.createElement("p", {
-    key: i,
-    className: "text-xs text-stone-500 font-mono break-all mt-1"
-  }, "ブロック#", a.blockIndex, " → ", /*#__PURE__*/React.createElement("a", {
-    className: "text-indigo-600 underline",
-    href: "https://sepolia.etherscan.io/tx/" + a.txHash,
-    target: "_blank",
-    rel: "noopener noreferrer"
-  }, a.txHash)))), /*#__PURE__*/React.createElement("div", {
+  }, "・", p)))), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-col gap-2"
   }, chain.length === 0 ? /*#__PURE__*/React.createElement("div", {
     className: "bg-white border border-dashed border-stone-300 rounded-xl p-10 text-center text-stone-400 text-sm"
@@ -1834,9 +1606,14 @@ function StatCards({
     label: "Web検索",
     value: stats.searches + "回",
     sub: "実行回数"
+  }, {
+    label: "画面離脱(別タブ等)",
+    value: (stats.awayCount || 0) + "回",
+    sub: "計 " + fmtMs(stats.awayMs || 0),
+    warn: (stats.awayMs || 0) > 10 * 60 * 1000
   }];
   return /*#__PURE__*/React.createElement("div", {
-    className: "grid grid-cols-2 md:grid-cols-5 gap-3"
+    className: "grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3"
   }, items.map(it => /*#__PURE__*/React.createElement("div", {
     key: it.label,
     className: "bg-white rounded-xl border p-3 " + (it.warn ? "border-amber-300" : "border-stone-200")
