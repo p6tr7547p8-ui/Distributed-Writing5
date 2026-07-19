@@ -655,7 +655,7 @@ function computeProvenance(events) {
       continue;
     }
     if (e.d) {
-      const src = e.type === "aiInsert" ? "a" : e.type === "paste" ? e.src === "ai" ? "a" : "p" : "t";
+      const src = e.type === "aiInsert" ? "a" : e.type === "paste" ? e.src === "ai" ? "a" : e.src === "process" ? "x" : "p" : "t";
       const insLen = (e.d.i || "").length;
       const p = Math.max(0, Math.min(e.d.p, tags.length));
       const s = Math.max(0, Math.min(e.d.s, tags.length - p));
@@ -707,7 +707,8 @@ function computeStats(events, finalText) {
     pasted = 0;
     aiChars = 0;
     for (const t of tags) {
-      if (t === "p") pasted++;else if (t === "a") aiChars++;
+      if (t === "p" || t === "x") pasted++; // 他者過程由来もコピペとして算入
+      else if (t === "a") aiChars++;
     }
   } else {
     // 差分ログを持たない旧データ用のフォールバック(挿入量の累積。上限を総文字数に丸める)
@@ -1445,7 +1446,9 @@ function StudentEditor({
     onClick: submit,
     disabled: submitStatus.state === "saving",
     className: "px-5 py-2 bg-stone-900 text-white text-sm font-medium rounded-lg hover:bg-stone-700 disabled:opacity-50"
-  }, submitStatus.state === "saving" ? "提出中…" : "レポートを提出")))), /*#__PURE__*/React.createElement("div", {
+  }, submitStatus.state === "saving" ? "提出中…" : "レポートを提出"))), /*#__PURE__*/React.createElement("p", {
+    className: "px-4 pb-3 text-xs text-stone-400"
+  }, "一時保存から再開する手順: 同じ端末・同じ氏名でこのページを開き直すと、画面上部に「一時保存された下書き」の案内が表示されます。「再開する」を押すと、本文と執筆記録の続きから再開できます。")), /*#__PURE__*/React.createElement("div", {
     className: "bg-white rounded-xl border border-stone-200 shadow-sm flex flex-col"
   }, /*#__PURE__*/React.createElement("div", {
     className: "flex border-b border-stone-100"
@@ -1534,61 +1537,61 @@ function ProcessPlayer({
   useEffect(() => {
     if (onProgress) onProgress(idx);
   }, [idx, onProgress]);
-  const texts = useMemo(() => {
-    let cur = "";
-    return events.map(e => {
-      if (e.snapshot != null) cur = e.snapshot;else if (e.d) cur = applyDiff(cur, e.d);
-      return cur;
-    });
+
+  // 差分ログから、各時点の本文とその文字単位の由来(プロベナンス)を復元。
+  // 由来: t=手入力 / p=コピペ / a=AI由来 / x=他者の過程由来
+  // → 色は「入力の瞬間」ではなく、その部分が本文に存在する限り継続して表示される。
+  const {
+    texts,
+    tagStrs
+  } = useMemo(() => {
+    let curT = "";
+    let tags = "";
+    const textsA = [];
+    const tagsA = [];
+    for (const e of events) {
+      if (e.type === "start") {
+        curT = e.snapshot || "";
+        tags = "t".repeat(curT.length);
+      } else if (e.d) {
+        const src = e.type === "aiInsert" ? "a" : e.type === "paste" ? e.src === "ai" ? "a" : e.src === "process" ? "x" : "p" : "t";
+        const pN = Math.max(0, Math.min(e.d.p, curT.length));
+        const sN = Math.max(0, Math.min(e.d.s, curT.length - pN));
+        const ins = e.d.i || "";
+        curT = curT.slice(0, pN) + ins + curT.slice(curT.length - sN);
+        tags = tags.slice(0, pN) + src.repeat(ins.length) + tags.slice(tags.length - sN);
+      } else if (e.snapshot != null) {
+        curT = e.snapshot;
+        if (tags.length !== curT.length) tags = (tags + "t".repeat(curT.length)).slice(0, curT.length);
+      }
+      textsA.push(curT);
+      tagsA.push(tags);
+    }
+    return {
+      texts: textsA,
+      tagStrs: tagsA
+    };
   }, [events]);
   const currentText = texts[idx] || "";
-  const insertedSoFar = useMemo(() => {
-    const arr = [];
-    for (let i = 0; i <= idx; i++) {
-      const e = events[i];
-      if (e && (e.type === "paste" || e.type === "aiInsert") && e.text) {
-        arr.push({
-          text: e.text,
-          type: e.type === "paste" && e.src === "ai" ? "aiInsert" : e.type === "paste" && e.src === "process" ? "processPaste" : e.type
+
+  // 現時点の本文を由来ごとの区間に分割して着色
+  const rendered = useMemo(() => {
+    const txt = currentText;
+    const T = tagStrs[idx] || "";
+    const segs = [];
+    let s0 = 0;
+    for (let i = 1; i <= txt.length; i++) {
+      if (i === txt.length || (T[i] || "t") !== (T[s0] || "t")) {
+        const tg = T[s0] || "t";
+        segs.push({
+          text: txt.slice(s0, i),
+          mark: tg === "p" ? "paste" : tg === "a" ? "aiInsert" : tg === "x" ? "processPaste" : null
         });
+        s0 = i;
       }
     }
-    return arr;
-  }, [idx, events]);
-  const rendered = useMemo(() => {
-    let segments = [{
-      text: currentText,
-      mark: null
-    }];
-    insertedSoFar.forEach(ins => {
-      const next = [];
-      segments.forEach(seg => {
-        if (seg.mark || !ins.text || ins.text.length < 4) {
-          next.push(seg);
-          return;
-        }
-        const p = seg.text.indexOf(ins.text);
-        if (p === -1) {
-          next.push(seg);
-          return;
-        }
-        if (p > 0) next.push({
-          text: seg.text.slice(0, p),
-          mark: null
-        });
-        next.push({
-          text: ins.text,
-          mark: ins.type
-        });
-        if (p + ins.text.length < seg.text.length) next.push({
-          text: seg.text.slice(p + ins.text.length),
-          mark: null
-        });
-      });
-      segments = next;
-    });
-    return segments;
-  }, [currentText, insertedSoFar]);
+    return segs;
+  }, [currentText, tagStrs, idx]);
   useEffect(() => {
     if (!playing) return;
     if (idx >= events.length - 1) {
@@ -1632,14 +1635,14 @@ function ProcessPlayer({
         {
           const head = e.src === "ai" ? "AIの回答をコピペ: 「" : e.src === "process" ? "他者の過程からコピペ: 「" : "コピペ: 「";
           const tail = e.src === "ai" ? " ※AI由来として算入" : e.src === "process" ? " ※出所: " + (e.srcStudent || "?") + " の過程" + (e.srcTokenId ? "(" + e.srcTokenId + ")" : "") + "(出所付きで記録)" : "";
-          return head + (e.text || "").slice(0, 40) + ((e.text || "").length > 40 ? "…" : "") + "」(" + (e.text || "").length + "字) を位置" + e.pos + "に貼り付け" + tail;
+          return head + (e.text || "") + "」(" + (e.text || "").length + "字) を位置" + e.pos + "に貼り付け" + tail;
         }
       case "search":
         return "Web検索: 「" + e.query + "」" + (e.provider === "google" ? " (Google CSE)" : e.provider === "gemini" ? " (Gemini検索)" : "");
       case "searchResult":
         return "検索結果を閲覧 (「" + e.query + "」 " + (e.resultCount != null ? e.resultCount + "件" : "") + ")";
       case "ai":
-        return "AIに依頼: 「" + (e.prompt || "").slice(0, 40) + "」" + (e.provider === "gemini" ? " (Gemini)" : "");
+        return "AIに依頼: 「" + (e.prompt || "") + "」" + (e.provider === "gemini" ? " (Gemini)" : "");
       case "aiResult":
         return "AIの回答を閲覧";
       case "aiInsert":
@@ -1714,14 +1717,24 @@ function ProcessPlayer({
     style: {
       left: (duration ? (cur.t || 0) / duration * 100 : 0) + "%"
     }
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: 0,
+    max: Math.max(0, events.length - 1),
+    value: idx,
+    onChange: e2 => {
+      setPlaying(false);
+      setIdx(Number(e2.target.value));
+    },
+    className: "absolute inset-0 w-full h-full opacity-0 cursor-pointer"
   })), /*#__PURE__*/React.createElement("div", {
-    className: "rounded-lg px-4 py-2 text-sm ring-1 " + meta.ring + " bg-white flex items-center gap-2"
+    className: "rounded-lg px-4 py-2 text-sm ring-1 " + meta.ring + " bg-white flex items-start gap-2"
   }, /*#__PURE__*/React.createElement("span", {
     className: "w-2.5 h-2.5 rounded-full " + meta.color
   }), /*#__PURE__*/React.createElement("span", {
     className: "font-medium " + meta.text
   }, meta.label), /*#__PURE__*/React.createElement("span", {
-    className: "text-stone-600 truncate"
+    className: "text-stone-600 whitespace-pre-wrap break-words flex-1 max-h-28 overflow-auto"
   }, describe(cur, idx))), /*#__PURE__*/React.createElement("div", {
     onCopy: () => {
       if (sourceInfo) registerReplayCopy(sourceInfo, idx);
@@ -2230,7 +2243,7 @@ function SharedProcesses({
     className: "text-lg font-semibold text-stone-900"
   }, "共有された生成過程(追体験ライブラリ)"), /*#__PURE__*/React.createElement("p", {
     className: "text-sm text-stone-500"
-  }, "教員が公開した生成過程です。追体験するとその閲覧が記録され(層1)、参考にした場合は提出時に過程引用として記録できます(層3)。NFTの所有は作成者に固定されたまま変わりません。"), subs.length === 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "教員が公開した生成過程です。追体験するとその閲覧が記録され、参考にした場合は提出時に過程引用として記録できます。NFTの所有は作成者に固定されたまま変わりません。"), subs.length === 0 ? /*#__PURE__*/React.createElement("div", {
     className: "bg-white border border-dashed border-stone-300 rounded-xl p-10 text-center text-stone-400 text-sm"
   }, "まだ共有された生成過程はありません。") : subs.map(s => {
     return /*#__PURE__*/React.createElement("div", {
@@ -2394,7 +2407,8 @@ function App() {
   const [role, setRole] = useState(FIXED_ROLE || "student");
   const [studentTab, setStudentTab] = useState("write");
   const [teacherTab, setTeacherTab] = useState("list");
-  const [studentName, setStudentName] = useState("学生A");
+  const [studentName, setStudentName] = useState("");
+  const [tempName, setTempName] = useState("");
   const [seeding, setSeeding] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
   const [refreshSignal, setRefreshSignal] = useState(0);
@@ -2507,16 +2521,18 @@ function App() {
     className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "chain" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
   }, "ブロックチェーン"), /*#__PURE__*/React.createElement("span", {
     className: "ml-auto text-xs text-stone-400 font-mono"
-  }, "DID: ", didOf(studentName))), studentTab === "write" ? /*#__PURE__*/React.createElement(StudentEditor, {
+  }, "DID: ", didOf(studentName))), /*#__PURE__*/React.createElement("div", {
+    className: studentTab === "write" ? "" : "hidden"
+  }, /*#__PURE__*/React.createElement(StudentEditor, {
     key: editorKey,
     studentName: studentName,
     settings: settings,
     onSubmitted: handleSubmitted,
     onOpenSettings: () => setShowSettings(true)
-  }) : studentTab === "shared" ? /*#__PURE__*/React.createElement(SharedProcesses, {
+  })), studentTab === "shared" && /*#__PURE__*/React.createElement(SharedProcesses, {
     key: refreshSignal,
     viewerName: studentName
-  }) : /*#__PURE__*/React.createElement(BlockchainView, {
+  }), studentTab === "chain" && /*#__PURE__*/React.createElement(BlockchainView, {
     key: "c" + refreshSignal,
     viewerName: studentName
   })) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
@@ -2538,7 +2554,36 @@ function App() {
   }, seeding ? "生成中…" : "デモ提出物を生成(動作確認用)"))) : /*#__PURE__*/React.createElement(BlockchainView, {
     key: "tc" + refreshSignal,
     viewerName: "teacher"
-  }))), showSettings && /*#__PURE__*/React.createElement(SettingsPanel, {
+  }))), role === "student" && !studentName.trim() && /*#__PURE__*/React.createElement("div", {
+    className: "fixed inset-0 bg-stone-900 bg-opacity-60 flex items-center justify-center z-50 p-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bg-white rounded-xl shadow-xl max-w-sm w-full p-6 flex flex-col gap-3"
+  }, /*#__PURE__*/React.createElement("h2", {
+    className: "font-semibold text-stone-900"
+  }, "氏名の設定"), /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-stone-500"
+  }, "システムを利用する前に、あなたの氏名を入力してください。提出物・一時保存・追体験の記録はこの氏名に紐づきます。"), /*#__PURE__*/React.createElement("input", {
+    value: tempName,
+    onChange: e => setTempName(e.target.value),
+    onKeyDown: e => {
+      if (e.key === "Enter" && tempName.trim()) {
+        setStudentName(tempName.trim());
+        setEditorKey(k => k + 1);
+      }
+    },
+    placeholder: "例: 山田 太郎",
+    autoFocus: true,
+    className: "border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-stone-500"
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      if (tempName.trim()) {
+        setStudentName(tempName.trim());
+        setEditorKey(k => k + 1);
+      }
+    },
+    disabled: !tempName.trim(),
+    className: "px-5 py-2 bg-stone-900 text-white text-sm rounded-lg hover:bg-stone-700 disabled:opacity-40"
+  }, "この名前で開始"))), showSettings && /*#__PURE__*/React.createElement(SettingsPanel, {
     settings: settings,
     onSave: saveSettings,
     onClose: () => setShowSettings(false)
